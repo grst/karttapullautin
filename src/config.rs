@@ -28,6 +28,16 @@ pub struct Config {
     pub savetempfiles: bool,
     pub savetempfolders: bool,
 
+    /// Buffer in meters read from neighboring tiles in batch mode.
+    pub batchbuffer: f64,
+
+    /// Automatically run the merge steps (pngmerge, dxfmerge, GeoJSON merge) after batch.
+    pub batchmerge: bool,
+
+    /// EPSG code of the input data's projected CRS, written to GeoJSON output.
+    /// None (key unset) omits the CRS declaration from the output.
+    pub epsg: Option<u32>,
+
     pub scalefactor: f64,
     pub vege_bitmode: bool,
     pub zoff: f64,
@@ -92,6 +102,13 @@ pub struct Config {
     pub water: u8,
     pub buildings: u8,
     pub waterele: f64,
+
+    // vegetation vector export
+    pub vectorvege: bool,
+    /// ISOM code per greenshade index (1-based); shorter list repeats its last value.
+    pub greenshadeisom: Vec<u16>,
+    /// Douglas-Peucker tolerance in meters for vegetation polygons; 0 disables simplification.
+    pub vegesimplify: f64,
 
     // render
     pub buildingcolor: (u8, u8, u8),
@@ -170,6 +187,9 @@ impl Config {
 
         let lazfolder = gs.get("lazfolder").unwrap_or("").to_string();
         let batchoutfolder = gs.get("batchoutfolder").unwrap_or("").to_string();
+        let batchbuffer: f64 = parse_typed(gs, "batchbuffer", 127.0);
+        let batchmerge: bool = gs.get("batchmerge").unwrap_or("0") == "1";
+        let epsg: Option<u32> = gs.get("epsg").and_then(|s| s.trim().parse().ok());
         let savetempfiles: bool = gs.get("savetempfiles").unwrap() == "1";
         let savetempfolders: bool = gs.get("savetempfolders").unwrap() == "1";
 
@@ -340,6 +360,15 @@ impl Config {
         let label_depressions: bool = gs.get("label_formlines_depressions").unwrap_or("0") == "1";
         let remove_touching_contours: bool =
             gs.get("remove_touching_contours").unwrap_or("0") == "1";
+        let vectorvege: bool = gs.get("vectorvege").unwrap_or("0") == "1";
+        let greenshadeisom: Vec<u16> = gs
+            .get("greenshadeisom")
+            .unwrap_or("406|406|408|408|410")
+            .split('|')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let vegesimplify: f64 = parse_typed(gs, "vegesimplify", 2.0);
+
         let batch = gs.get("batch").unwrap() == "1";
         if batch && processes == 0 {
             return Err(
@@ -361,6 +390,9 @@ impl Config {
             pnorthlineswidth,
             lazfolder,
             batchoutfolder,
+            batchbuffer,
+            batchmerge,
+            epsg,
             savetempfolders,
             savetempfiles,
             scalefactor,
@@ -416,6 +448,9 @@ impl Config {
             water,
             buildings,
             waterele,
+            vectorvege,
+            greenshadeisom,
+            vegesimplify,
             buildingcolor,
             vectorconf,
             mtkskiplayers,

@@ -17,6 +17,8 @@ pub struct Condition {
 /// Each mapping represents one line in the vectorconf file
 #[derive(Debug, PartialEq)]
 pub struct Mapping {
+    /// The free-text description (first field), used as feature category in vector export
+    pub description: String,
     /// The ISOM code that this mapping maps the shape to
     pub isom: String,
     /// The conditions that must be met for this mapping to be applied
@@ -35,6 +37,7 @@ impl FromStr for Mapping {
                 line
             ));
         }
+        let description = row_data[0].to_string();
         let isom = row_data[1].to_string();
         if isom.is_empty() {
             return Err(format!("ISOM code most not be empty: {line}"));
@@ -60,7 +63,11 @@ impl FromStr for Mapping {
             })
             .collect::<Result<Vec<_>, Self::Err>>()?;
 
-        Ok(Self { isom, conditions })
+        Ok(Self {
+            description,
+            isom,
+            conditions,
+        })
     }
 }
 
@@ -86,6 +93,7 @@ mod tests {
         let line = "description|306|key1=value1";
         let mapping = Mapping::from_str(line).unwrap();
         let expected = Mapping {
+            description: "description".to_string(),
             isom: "306".to_string(),
             conditions: vec![Condition {
                 operator: Operator::Equal,
@@ -101,6 +109,7 @@ mod tests {
         let line = "description|306|key1=value1&key2!=value2";
         let mapping = Mapping::from_str(line).unwrap();
         let expected = Mapping {
+            description: "description".to_string(),
             isom: "306".to_string(),
             conditions: vec![
                 Condition {
@@ -123,6 +132,7 @@ mod tests {
         let line = "description|306|key1=value1&key2!=value2&key3=value3";
         let mapping = Mapping::from_str(line).unwrap();
         let expected = Mapping {
+            description: "description".to_string(),
             isom: "306".to_string(),
             conditions: vec![
                 Condition {

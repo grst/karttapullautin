@@ -8,6 +8,7 @@ pub mod cliffs;
 pub mod config;
 pub mod contours;
 pub mod crop;
+pub mod geojson;
 pub mod geometry;
 pub mod io;
 pub mod knolls;
@@ -18,6 +19,7 @@ pub mod process;
 pub mod render;
 pub mod util;
 pub mod vec2d;
+pub mod vege_vector;
 pub mod vegetation;
 
 #[cfg(feature = "shapefile")]
