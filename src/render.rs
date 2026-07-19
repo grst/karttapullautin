@@ -941,6 +941,17 @@ pub fn draw_curves(
         if config.output_dxf {
             out_formlines.to_dxf(&mut fs.create(tmpfolder.join("formlines.dxf"))?)?;
         }
+
+        // Emitted here, next to the file it mirrors, because the form lines only exist
+        // at this point; batch mode crops it along with the other layers.
+        if config.output_geojson {
+            crate::geojson::bindxf_to_geojson(
+                fs,
+                &tmpfolder.join("formlines.dxf.bin"),
+                &tmpfolder.join("formlines.geojson"),
+                config.epsg,
+            )?;
+        }
     }
 
     Ok(())

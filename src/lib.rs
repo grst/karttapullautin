@@ -8,6 +8,7 @@ pub mod cliffs;
 pub mod config;
 pub mod contours;
 pub mod crop;
+pub mod geojson;
 pub mod geometry;
 pub mod io;
 pub mod knolls;

@@ -28,6 +28,16 @@ pub struct Config {
     pub savetempfiles: bool,
     pub savetempfolders: bool,
 
+    /// Buffer in meters read from neighboring tiles in batch mode.
+    pub batchbuffer: f64,
+
+    /// Whether to also write the vector layers as GeoJSON.
+    pub output_geojson: bool,
+
+    /// EPSG code of the input data's projected CRS, written to GeoJSON output.
+    /// None (key unset) omits the CRS declaration from the output.
+    pub epsg: Option<u32>,
+
     pub scalefactor: f64,
     pub vege_bitmode: bool,
     pub zoff: f64,
@@ -173,6 +183,9 @@ impl Config {
 
         let lazfolder = gs.get("lazfolder").unwrap_or("").to_string();
         let batchoutfolder = gs.get("batchoutfolder").unwrap_or("").to_string();
+        let batchbuffer: f64 = parse_typed(gs, "batchbuffer", 127.0);
+        let output_geojson: bool = gs.get("output_geojson").unwrap_or("0") == "1";
+        let epsg: Option<u32> = gs.get("epsg").and_then(|s| s.trim().parse().ok());
         let savetempfiles: bool = gs.get("savetempfiles").unwrap() == "1";
         let savetempfolders: bool = gs.get("savetempfolders").unwrap() == "1";
 
@@ -378,6 +391,9 @@ impl Config {
             pnorthlineswidth,
             lazfolder,
             batchoutfolder,
+            batchbuffer,
+            output_geojson,
+            epsg,
             savetempfolders,
             savetempfiles,
             scalefactor,

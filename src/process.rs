@@ -56,8 +56,8 @@ pub fn launch_threads<F: FileSystem + Send + Clone + 'static>(
         crate::shapefile::unzip_shapefiles(&fs, zip_files).unwrap();
     }
 
-    // TODO: this is hard-coded but should maybe be configurable?
-    let padding = 127.0;
+    // how far into the neighbouring tiles we read, so tile edges come out seamless
+    let padding = config.batchbuffer;
 
     // folder where we store temporary extracted files to process later
     let staging_folder = Path::new("temp_staging");
@@ -546,6 +546,25 @@ pub fn process_tile(
         info!("Contour generation part 4");
         timing.start_section("contour generation part 4");
         knolls::dotknolls(fs, config, tmpfolder).unwrap();
+
+        if config.output_geojson {
+            // The .dxf.bin family only leaves the temp folder when savetempfiles is on, so
+            // emit the GeoJSON next to the file it mirrors and let batch mode crop it.
+            crate::geojson::bindxf_to_geojson(
+                fs,
+                &tmpfolder.join("out2.dxf.bin"),
+                &tmpfolder.join("contours.geojson"),
+                config.epsg,
+            )
+            .unwrap();
+            crate::geojson::bindxf_to_geojson(
+                fs,
+                &tmpfolder.join("dotknolls.dxf.bin"),
+                &tmpfolder.join("dotknolls.geojson"),
+                config.epsg,
+            )
+            .unwrap();
+        }
     }
 
     if !cliffsonly && !contoursonly {
@@ -1054,6 +1073,23 @@ pub fn batch_process(
                 maxy,
             )
             .unwrap();
+        }
+
+        // crop the per-tile GeoJSON layers (present when output_geojson=1) to the tile bounds
+        for name in crate::geojson::GEOJSON_NAMES {
+            let geojson_file = PathBuf::from(format!("temp{thread}/{name}.geojson"));
+            if fs.exists(&geojson_file) {
+                crate::geojson::crop_geojson(
+                    fs,
+                    &geojson_file,
+                    Path::new(&format!("{batchoutfolder}/{laz}_{name}.geojson")),
+                    minx,
+                    miny,
+                    maxx,
+                    maxy,
+                )
+                .unwrap();
+            }
         }
         if savetempfolders {
             fs.create_dir_all(format!("temp_{laz}_dir"))
