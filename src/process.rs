@@ -56,8 +56,8 @@ pub fn launch_threads<F: FileSystem + Send + Clone + 'static>(
         crate::shapefile::unzip_shapefiles(&fs, zip_files).unwrap();
     }
 
-    // how far into the neighbouring tiles we read, so tile edges come out seamless
-    let padding = config.batchbuffer;
+    // TODO: this is hard-coded but should maybe be configurable?
+    let padding = 127.0;
 
     // folder where we store temporary extracted files to process later
     let staging_folder = Path::new("temp_staging");
