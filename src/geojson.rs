@@ -1,7 +1,8 @@
 //! GeoJSON output for vector features (vegetation polygons, OSM features, contours),
 //! plus bbox cropping and batch merging of the produced files.
 //!
-//! Coordinates are written in the native projected CRS of the input data.
+//! Coordinates are written in the native projected CRS of the input data, or in WGS84 for
+//! the batch outputs with `geojson_wgs84` (see [`Wgs84`]).
 
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
@@ -9,7 +10,7 @@ use std::path::Path;
 use log::info;
 use serde_json::{Value, json};
 
-use crate::geometry::{BinaryDxf, Classification, Geometry};
+use crate::geometry::{BinaryDxf, Geometry};
 use crate::io::fs::FileSystem;
 /// Rust types generated from `schema/geojson.schema.json` by `typify` in `build.rs`.
 ///
@@ -21,54 +22,25 @@ mod geojson_types {
     include!(concat!(env!("OUT_DIR"), "/geojson_types.rs"));
 }
 
-/// One GeoJSON vector output: its file-name suffix and whether it is also
-/// carried by `merged.dxf.bin` (and thus skipped from the merged-GeoJSON route
-/// in `export_combined` when that file exists).
-///
-/// Add new outputs here. Set `skip_when_merged_bin: true` if the feature also
-/// rides `merged.dxf.bin`.
+/// One GeoJSON vector output, by its file-name suffix: `temp/<name>.geojson` per tile,
+/// `<tile>_<name>.geojson` in the batch output folder, `merged_<name>.geojson` after
+/// `batchmerge`. Add new outputs here.
 pub struct GeoJsonOutput {
     pub name: &'static str,
-    pub skip_when_merged_bin: bool,
 }
 
 pub const GEOJSON_OUTPUTS: &[GeoJsonOutput] = &[
-    GeoJsonOutput {
-        name: "contours",
-        skip_when_merged_bin: true,
-    },
-    GeoJsonOutput {
-        name: "formlines",
-        skip_when_merged_bin: true,
-    },
-    GeoJsonOutput {
-        name: "dotknolls",
-        skip_when_merged_bin: false,
-    },
-    GeoJsonOutput {
-        name: "cliffs",
-        skip_when_merged_bin: true,
-    },
-    GeoJsonOutput {
-        name: "vegetation",
-        skip_when_merged_bin: false,
-    },
-    GeoJsonOutput {
-        name: "yellow",
-        skip_when_merged_bin: false,
-    },
+    GeoJsonOutput { name: "contours" },
+    GeoJsonOutput { name: "formlines" },
+    GeoJsonOutput { name: "dotknolls" },
+    GeoJsonOutput { name: "cliffs" },
+    GeoJsonOutput { name: "vegetation" },
+    GeoJsonOutput { name: "yellow" },
     GeoJsonOutput {
         name: "undergrowth",
-        skip_when_merged_bin: false,
     },
-    GeoJsonOutput {
-        name: "osm_lines",
-        skip_when_merged_bin: false,
-    },
-    GeoJsonOutput {
-        name: "osm_areas",
-        skip_when_merged_bin: false,
-    },
+    GeoJsonOutput { name: "osm_lines" },
+    GeoJsonOutput { name: "osm_areas" },
 ];
 
 /// Legacy GeoJSON `crs` member for a projected EPSG code. RFC 7946 dropped `crs`, but
@@ -94,6 +66,59 @@ fn write_prelude<W: Write>(w: &mut W, crs: Option<&Value>) -> anyhow::Result<()>
 /// Round to cm to keep files small; sub-cm is noise at map scale.
 fn r2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+/// Round to 1e-7 degrees (about 1 cm), the WGS84 counterpart of [`r2`].
+fn r7(v: f64) -> f64 {
+    (v * 1e7).round() / 1e7
+}
+
+/// Reprojection from the data's projected CRS to WGS84 longitude/latitude, the only CRS
+/// RFC 7946 allows and the only one tools such as tippecanoe read.
+pub struct Wgs84 {
+    src: proj4rs::Proj,
+    dst: proj4rs::Proj,
+}
+
+impl Wgs84 {
+    pub fn new(epsg: u32) -> anyhow::Result<Self> {
+        let proj = |code: u32| {
+            u16::try_from(code)
+                .ok()
+                .and_then(|c| proj4rs::Proj::from_epsg_code(c).ok())
+                .ok_or_else(|| anyhow::anyhow!("no projection definition for EPSG:{code}"))
+        };
+        Ok(Self {
+            src: proj(epsg)?,
+            dst: proj(4326)?,
+        })
+    }
+
+    pub fn point(&self, p: [f64; 2]) -> anyhow::Result<[f64; 2]> {
+        let mut q = (p[0], p[1], 0.0);
+        proj4rs::transform::transform(&self.src, &self.dst, &mut q)?;
+        // proj4rs yields geographic coordinates in radians
+        Ok([r7(q.0.to_degrees()), r7(q.1.to_degrees())])
+    }
+
+    /// Reproject every position of a GeoJSON geometry in place.
+    pub fn geometry(&self, geometry: &mut Value) -> anyhow::Result<()> {
+        fn walk(w: &Wgs84, v: &mut Value) -> anyhow::Result<()> {
+            let Some(items) = v.as_array_mut() else {
+                return Ok(());
+            };
+            if let (Some(x), Some(y)) = (
+                items.first().and_then(Value::as_f64),
+                items.get(1).and_then(Value::as_f64),
+            ) {
+                let [lon, lat] = w.point([x, y])?;
+                *v = json!([lon, lat]);
+                return Ok(());
+            }
+            items.iter_mut().try_for_each(|c| walk(w, c))
+        }
+        walk(self, &mut geometry["coordinates"])
+    }
 }
 
 /// Build a coordinate array for one line/ring.
@@ -394,7 +419,8 @@ fn clip_polygon(rings: &Value, minx: f64, miny: f64, maxx: f64, maxy: f64) -> Op
     Some(Value::Array(out))
 }
 
-/// Crop all features of a GeoJSON file to the bbox and write the result.
+/// Crop all features of a GeoJSON file to the bbox and write the result. With `to_wgs84`
+/// the cropped features are then reprojected, so the clip itself stays in metres.
 #[allow(clippy::too_many_arguments)]
 pub fn crop_geojson(
     fs: &impl FileSystem,
@@ -404,6 +430,7 @@ pub fn crop_geojson(
     miny: f64,
     maxx: f64,
     maxy: f64,
+    to_wgs84: Option<&Wgs84>,
 ) -> anyhow::Result<()> {
     let val: Value = serde_json::from_reader(BufReader::new(fs.open(input)?))?;
     let empty = Vec::new();
@@ -468,14 +495,22 @@ pub fn crop_geojson(
         if let Some((gtype, coordinates)) = new_geom {
             let mut nf = f.clone();
             nf["geometry"] = json!({"type": gtype, "coordinates": coordinates});
+            if let Some(w) = to_wgs84 {
+                w.geometry(&mut nf["geometry"])?;
+            }
             out.push(nf);
         }
     }
-    // the input's crs declaration (if any) is carried over verbatim
+    // the input's crs declaration (if any) is carried over verbatim; WGS84 is RFC 7946's
+    // implied default and is declared by leaving `crs` out
     write_feature_collection(
         &mut BufWriter::new(fs.create(output)?),
         &out,
-        val.get("crs"),
+        if to_wgs84.is_some() {
+            None
+        } else {
+            val.get("crs")
+        },
     )
 }
 
@@ -838,69 +873,137 @@ fn chain_cliff_dashes(mids: &[[f64; 2]]) -> Vec<Vec<[f64; 2]>> {
         clusters.entry(r).or_default().push(i);
     }
 
+    // in order of each cluster's first dash, so the output does not depend on hashing
+    let mut clusters: Vec<Vec<usize>> = clusters.into_values().collect();
+    clusters.sort_unstable_by_key(|members| members[0]);
+    log::debug!(
+        "cliff clusters: {} from {} dashes, largest {}",
+        clusters.len(),
+        mids.len(),
+        clusters.iter().map(Vec::len).max().unwrap_or(0)
+    );
+    let mut used = vec![false; mids.len()];
     let mut chains = Vec::new();
-    for members in clusters.values() {
+    for members in &clusters {
         // start from the point farthest from the cluster centroid
         let n = members.len() as f64;
         let cx = members.iter().map(|&i| mids[i][0]).sum::<f64>() / n;
         let cy = members.iter().map(|&i| mids[i][1]).sum::<f64>() / n;
-        let mut rest: Vec<usize> = members.clone();
-        let start_pos = rest
+        let start = *members
             .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
+            .max_by(|a, b| {
                 dist(mids[**a], [cx, cy])
                     .partial_cmp(&dist(mids[**b], [cx, cy]))
                     .unwrap()
             })
-            .map(|(p, _)| p)
             .unwrap();
-        let mut path = vec![mids[rest.swap_remove(start_pos)]];
-        while !rest.is_empty() {
-            let last = *path.last().unwrap();
-            let next_pos = rest
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| {
-                    dist(mids[**a], last)
-                        .partial_cmp(&dist(mids[**b], last))
-                        .unwrap()
-                })
-                .map(|(p, _)| p)
-                .unwrap();
-            path.push(mids[rest.swap_remove(next_pos)]);
+        // this cluster's own index, so the walk cannot step into a neighbouring cluster
+        let mut local: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        for &i in members {
+            let m = mids[i];
+            local
+                .entry(((m[0] / cell) as i64, (m[1] / cell) as i64))
+                .or_default()
+                .push(i);
         }
-        // 2-opt on the open path: reversing path[i+1..=j] swaps edges (i,i+1)/(j,j+1)
-        // for (i,j)/(i+1,j+1); when j is the last point only edge (i,i+1) is replaced.
-        // Clusters are a handful of dashes, so O(n²) passes are cheap.
-        let mut improved = true;
-        while improved {
-            improved = false;
-            let n = path.len();
-            for i in 0..n.saturating_sub(2) {
-                for j in i + 2..n {
-                    let (removed, added) = if j + 1 < n {
-                        (
-                            dist(path[i], path[i + 1]) + dist(path[j], path[j + 1]),
-                            dist(path[i], path[j]) + dist(path[i + 1], path[j + 1]),
-                        )
-                    } else {
-                        (dist(path[i], path[i + 1]), dist(path[i], path[j]))
-                    };
-                    if added + 1e-9 < removed {
-                        path[i + 1..=j].reverse();
-                        improved = true;
+        used[start] = true;
+        let mut path = vec![mids[start]];
+        for _ in 1..members.len() {
+            let next = nearest_unused(mids, &local, &used, *path.last().unwrap(), cell);
+            used[next] = true;
+            path.push(mids[next]);
+        }
+        two_opt(&mut path);
+        // A dense rock area is one cluster but no single line: a greedy walk across it
+        // jumps between strands. Break it there rather than draw the jumps.
+        let mut pieces: Vec<Vec<[f64; 2]>> = vec![Vec::new()];
+        for p in path {
+            let piece = pieces.last_mut().unwrap();
+            if piece.last().is_some_and(|q| dist(*q, p) > CLIFF_MAX_STEP_M) {
+                pieces.push(vec![p]);
+            } else {
+                piece.push(p);
+            }
+        }
+        for piece in pieces {
+            let len: f64 = piece.windows(2).map(|w| dist(w[0], w[1])).sum();
+            // single-dash clusters have zero path length; use the dash length itself
+            if len.max(2.9) >= CLIFF_MIN_LEN_M {
+                chains.push(piece);
+            }
+        }
+    }
+    chains
+}
+
+/// A step between two chained dashes longer than this is a jump between strands of the
+/// same rock area, not a continuation of one cliff line.
+const CLIFF_MAX_STEP_M: f64 = 2.0 * CLIFF_CLUSTER_DIST;
+
+/// The unused point nearest to `from`, searching the `cell`-sized grid in rings of cells
+/// outward. Assumes an unused point exists.
+fn nearest_unused(
+    mids: &[[f64; 2]],
+    grid: &std::collections::HashMap<(i64, i64), Vec<usize>>,
+    used: &[bool],
+    from: [f64; 2],
+    cell: f64,
+) -> usize {
+    let (gx, gy) = ((from[0] / cell) as i64, (from[1] / cell) as i64);
+    let mut best: Option<(f64, usize)> = None;
+    for r in 0i64.. {
+        // every point in ring r is at least (r - 1) cells away
+        if best.is_some_and(|(d, _)| d <= (r - 1) as f64 * cell) {
+            break;
+        }
+        for dx in -r..=r {
+            for dy in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue; // inside the ring, already searched
+                }
+                for &j in grid.get(&(gx + dx, gy + dy)).into_iter().flatten() {
+                    let d = dist(mids[j], from);
+                    if !used[j] && best.is_none_or(|(b, _)| d < b) {
+                        best = Some((d, j));
                     }
                 }
             }
         }
-        let len: f64 = path.windows(2).map(|w| dist(w[0], w[1])).sum();
-        // single-dash clusters have zero path length; use the dash length itself
-        if len.max(2.9) >= CLIFF_MIN_LEN_M {
-            chains.push(path);
+    }
+    best.unwrap().1
+}
+
+/// 2-opt on an open path: reversing path[i+1..=j] swaps edges (i,i+1)/(j,j+1) for
+/// (i,j)/(i+1,j+1); when j is the last point only edge (i,i+1) is replaced. It untangles
+/// the crossings greedy ordering leaves on sharply curved faces. Moves are limited to a
+/// window along the path, which is where those crossings are, so a rock area of tens of
+/// thousands of dashes stays linear rather than cubic.
+fn two_opt(path: &mut [[f64; 2]]) {
+    const WINDOW: usize = 64;
+    const MAX_PASSES: usize = 20;
+    let n = path.len();
+    for _ in 0..MAX_PASSES {
+        let mut improved = false;
+        for i in 0..n.saturating_sub(2) {
+            for j in i + 2..n.min(i + WINDOW) {
+                let (removed, added) = if j + 1 < n {
+                    (
+                        dist(path[i], path[i + 1]) + dist(path[j], path[j + 1]),
+                        dist(path[i], path[j]) + dist(path[i + 1], path[j + 1]),
+                    )
+                } else {
+                    (dist(path[i], path[i + 1]), dist(path[i], path[j]))
+                };
+                if added + 1e-9 < removed {
+                    path[i + 1..=j].reverse();
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            break;
         }
     }
-    chains
 }
 
 /// OCAD symbol number for a DXF layer in the cross reference table.
@@ -932,18 +1035,9 @@ const POINT_MIN_SPACING_M: f64 = 12.0;
 /// layer). Greedy spacing filter over points ranked by certainty: the detector's definite
 /// symbols (dotknoll/udepression) win over the uncertain "ugly" variants when two
 /// candidates are closer than the minimum.
-fn published_knolls(
-    fs: &impl FileSystem,
-    batchoutfolder: &str,
-) -> anyhow::Result<Vec<([f64; 2], String)>> {
-    let path = format!("{batchoutfolder}/merged_dotknolls.geojson");
-    if !fs.exists(&path) {
-        return Ok(Vec::new());
-    }
-    let val: Value = serde_json::from_reader(BufReader::new(fs.open(&path)?))?;
-    let empty = Vec::new();
+fn published_knolls(features: &[Value]) -> Vec<([f64; 2], String)> {
     let mut candidates: Vec<([f64; 2], String)> = Vec::new();
-    for f in val["features"].as_array().unwrap_or(&empty) {
+    for f in features {
         if f["geometry"]["type"].as_str() != Some("Point") {
             continue;
         }
@@ -965,14 +1059,174 @@ fn published_knolls(
             kept.push((p, layer));
         }
     }
-    Ok(kept)
+    kept
 }
 
-/// Combine every merged vector output into single-file `output.dxf` and
-/// `output.geojson`, plus `output.ocdCrt` for OCAD's layer-to-symbol conversion.
+/// The features of a GeoJSON file, or None when there is no such file.
+fn read_features(fs: &impl FileSystem, path: &Path) -> anyhow::Result<Option<Vec<Value>>> {
+    if !fs.exists(path) {
+        return Ok(None);
+    }
+    let mut val: Value = serde_json::from_reader(BufReader::new(fs.open(path)?))?;
+    Ok(Some(match val["features"].take() {
+        Value::Array(features) => features,
+        _ => Vec::new(),
+    }))
+}
+
+/// The parts of a LineString or MultiLineString geometry; nothing for any other type.
+fn line_parts(geometry: &Value) -> Vec<Vec<[f64; 2]>> {
+    match geometry["type"].as_str() {
+        Some("LineString") => vec![parse_line(&geometry["coordinates"])],
+        Some("MultiLineString") => geometry["coordinates"]
+            .as_array()
+            .map(|parts| parts.iter().map(parse_line).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// The rings of a Polygon or MultiPolygon geometry; nothing for any other type.
+fn polygon_rings(geometry: &Value) -> Vec<Vec<[f64; 2]>> {
+    let rings = |rings: &Value| -> Vec<Vec<[f64; 2]>> {
+        rings
+            .as_array()
+            .map(|r| r.iter().map(parse_line).collect())
+            .unwrap_or_default()
+    };
+    match geometry["type"].as_str() {
+        Some("Polygon") => rings(&geometry["coordinates"]),
+        Some("MultiPolygon") => geometry["coordinates"]
+            .as_array()
+            .map(|polys| polys.iter().flat_map(rings).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// A line feature made of `pieces`: a LineString for one, a MultiLineString for several
+/// (a contour broken around a knoll stays one feature), None for none.
+fn line_feature(mut pieces: Vec<Vec<[f64; 2]>>, properties: Value) -> Option<Value> {
+    let geometry = match pieces.len() {
+        0 => return None,
+        1 => json!({"type": "LineString", "coordinates": coords_line(pieces.remove(0))}),
+        _ => json!({
+            "type": "MultiLineString",
+            "coordinates": Value::Array(pieces.into_iter().map(coords_line).collect()),
+        }),
+    };
+    Some(json!({"type": "Feature", "properties": properties, "geometry": geometry}))
+}
+
+/// Turn one tile's raw vector outputs in `tmpfolder` into the features the map publishes,
+/// rewriting the files in place:
+///
+/// * `dotknolls`: the spacing filter of [`published_knolls`];
+/// * `contours` and `formlines`: each line generalised, broken around the knoll symbols
+///   and curve-sampled ([`published_pieces`]). With `formline=2` the half-interval
+///   `*_intermed` lines are only candidates -- the renderer's selection of them is
+///   `formlines` -- so they are dropped from `contours`; in the other modes they are
+///   drawn as full contours and published as 101;
+/// * `cliffs`: the renderer's per-cell dashes chained into cliff lines, sub-minimum faces
+///   dropped ([`chain_cliff_dashes`]).
+///
+/// It runs on the padded tile, before `batch_process` crops it, so a decision near a tile
+/// edge is made from the same ground on both sides of it. The area outputs are left as
+/// they are: the vegetation polygons are already smoothed with their shared boundaries
+/// point-identical, and fitting a curve to each ring on its own would open slivers.
+pub fn publish_tile(
+    fs: &impl FileSystem,
+    tmpfolder: &Path,
+    formline: f64,
+    epsg: Option<u32>,
+) -> anyhow::Result<()> {
+    let crs = crs(epsg);
+    let write = |name: &str, features: &[Value]| -> anyhow::Result<()> {
+        write_feature_collection(
+            &mut BufWriter::new(fs.create(tmpfolder.join(format!("{name}.geojson")))?),
+            features,
+            crs.as_ref(),
+        )
+    };
+
+    let mut knolls: Vec<[f64; 2]> = Vec::new();
+    if let Some(features) = read_features(fs, &tmpfolder.join("dotknolls.geojson"))? {
+        let kept = published_knolls(&features);
+        let out: Vec<Value> = kept
+            .iter()
+            .map(|(p, layer)| feature("Point", json!([r2(p[0]), r2(p[1])]), &layer_props(layer)))
+            .collect();
+        write("dotknolls", &out)?;
+        knolls = kept.into_iter().map(|(p, _)| p).collect();
+    }
+
+    for name in ["contours", "formlines"] {
+        let Some(features) = read_features(fs, &tmpfolder.join(format!("{name}.geojson")))? else {
+            continue;
+        };
+        let mut out = Vec::with_capacity(features.len());
+        for f in features {
+            let mut properties = f["properties"].clone();
+            if properties["layer"]
+                .as_str()
+                .is_some_and(|l| l.ends_with("_intermed"))
+            {
+                if formline == 2.0 {
+                    continue;
+                }
+                properties["isom"] = json!("101");
+            }
+            let isom = properties["isom"].as_str().unwrap_or_default().to_string();
+            let pieces = line_parts(&f["geometry"])
+                .iter()
+                .flat_map(|pts| {
+                    let closed = pts.len() > 2 && pts.first() == pts.last();
+                    published_pieces(&isom, pts, closed, &knolls)
+                })
+                .collect();
+            out.extend(line_feature(pieces, properties));
+        }
+        write(name, &out)?;
+    }
+
+    if let Some(features) = read_features(fs, &tmpfolder.join("cliffs.geojson"))? {
+        let (mut mids_202, mut mids_201) = (Vec::new(), Vec::new());
+        for f in &features {
+            for pts in line_parts(&f["geometry"]) {
+                let (Some(a), Some(b)) = (pts.first(), pts.last()) else {
+                    continue;
+                };
+                let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+                if f["properties"]["isom"] == "202" {
+                    mids_202.push(mid);
+                } else {
+                    mids_201.push(mid);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (mids, layer, isom) in [(&mids_202, "cliff2", "202"), (&mids_201, "cliff3", "201")] {
+            for chain in chain_cliff_dashes(mids) {
+                out.push(feature(
+                    "LineString",
+                    coords_line(curve_points(isom, &chain, false)),
+                    &[("layer", layer), ("isom", isom)],
+                ));
+            }
+        }
+        write("cliffs", &out)?;
+    }
+    Ok(())
+}
+
+/// Combine the merged per-tile outputs, already in their published form (see
+/// [`publish_tile`]), into a single `output.geojson`, plus `output.dxf` and
+/// `output.ocdCrt` for OCAD's layer-to-symbol conversion. The DXF is in the data's
+/// projected CRS, so it is not written when the GeoJSON was reprojected to WGS84.
 pub fn export_combined(
     fs: &impl FileSystem,
     epsg: Option<u32>,
+    wgs84: bool,
     batchoutfolder: &str,
 ) -> anyhow::Result<()> {
     use std::collections::BTreeSet;
@@ -990,251 +1244,71 @@ pub fn export_combined(
         }
     };
 
-    // contours, cliffs, formlines, dotknolls from the merged binary DXF (if present).
-    // Upstream bindxfmerge writes merged.dxf.bin to the working directory, not the
-    // output folder, so look in both.
-    let merged_bin = [
-        format!("{batchoutfolder}/merged.dxf.bin"),
-        "merged.dxf.bin".into(),
-    ]
-    .into_iter()
-    .find(|p| fs.exists(p));
-    let have_merged_bin = merged_bin.is_some();
-    // merged.dxf.bin only exists when savetempfiles is on; the map pipeline runs with it
-    // off, so form lines reach here as merged_formlines.geojson instead (written next to
-    // formlines.dxf.bin by render::draw_curves). Whichever source is present, symbol 103
-    // is the renderer's selected set — never the half-interval contours, which ISOM
-    // forbids as form lines.
-
-    // The knoll/depression point symbols have to be settled before any contour is
-    // emitted, because ISOM makes the contour give way to them (break_at_knolls).
-    // merged_dotknolls.geojson is the single source: the same points also ride
-    // merged.dxf.bin when savetempfiles is on, and are skipped there to avoid a
-    // duplicate.
-    let kept_knolls = published_knolls(fs, batchoutfolder)?;
-    let knoll_pts: Vec<[f64; 2]> = kept_knolls.iter().map(|(p, _)| *p).collect();
-
-    let mut cliff_mids_202: Vec<[f64; 2]> = Vec::new();
-    let mut cliff_mids_201: Vec<[f64; 2]> = Vec::new();
-    for source_bin in [merged_bin.clone()].into_iter().flatten() {
-        let dxf = BinaryDxf::from_reader(&mut fs.open(&source_bin)?)?;
-        for geom in dxf.take_geometry() {
-            match geom {
-                Geometry::Polylines2(pl) => {
-                    for (p, c) in pl.into_iter() {
-                        // internal knoll-detector artifact, not a map symbol
-                        if matches!(c, Classification::Knoll1010) {
-                            continue;
-                        }
-                        let mut pts: Vec<[f64; 2]> = p.iter().map(|pt| [pt.x, pt.y]).collect();
-                        let is_cliff = matches!(
-                            c,
-                            Classification::Cliff2
-                                | Classification::Cliff3
-                                | Classification::Cliff4
-                        );
-                        if is_cliff {
-                            // collect dash midpoints; chained into cliff lines below
-                            if !pts.is_empty() {
-                                let mid = [
-                                    (pts[0][0] + pts[pts.len() - 1][0]) / 2.0,
-                                    (pts[0][1] + pts[pts.len() - 1][1]) / 2.0,
-                                ];
-                                if matches!(c, Classification::Cliff2) {
-                                    cliff_mids_202.push(mid);
-                                } else {
-                                    cliff_mids_201.push(mid);
-                                }
-                            }
-                            continue;
-                        }
-                        // one Chaikin pass takes the segment jitter out of contour-family
-                        // lines (OCAD can additionally fit Bezier curves on import)
-                        let smooth = c.is_contour()
-                            || c.is_depression()
-                            || matches!(
-                                c,
-                                Classification::Formline
-                                    | Classification::FormlineDepression
-                                    | Classification::ContourSimple
-                            );
-                        if smooth && pts.len() > 3 {
-                            let as_p2: Vec<crate::geometry::Point2> = pts
-                                .iter()
-                                .map(|q| crate::geometry::Point2::new(q[0], q[1]))
-                                .collect();
-                            let closed = pts.first() == pts.last();
-                            let sm = if closed {
-                                let mut r =
-                                    crate::vege_vector::chaikin_closed(&as_p2[..as_p2.len() - 1]);
-                                if let Some(f) = r.first().cloned() {
-                                    r.push(f);
-                                }
-                                r
-                            } else {
-                                crate::vege_vector::chaikin_open(&as_p2)
-                            };
-                            pts = sm.iter().map(|q| [q.x, q.y]).collect();
-                        }
-                        let layer = layer_isom(c.to_layer()).unwrap_or(c.to_layer()).to_string();
-                        for piece in published_pieces(&layer, &pts, c.is_area(), &knoll_pts) {
-                            grow(&piece);
-                            dxf_curves_entity(&mut body, &layer, &piece, c.is_area(), None);
-                            feats.push(feature(
-                                "LineString",
-                                coords_line(piece),
-                                &layer_props(c.to_layer()),
-                            ));
-                        }
-                        layers.insert(layer);
-                    }
-                }
-                Geometry::Polylines3(pl) => {
-                    for (p, (c, h)) in pl.into_iter() {
-                        let layer = layer_isom(c.to_layer()).unwrap_or(c.to_layer()).to_string();
-                        let pts: Vec<[f64; 2]> = p.iter().map(|pt| [pt.x, pt.y]).collect();
-                        grow(&pts);
-                        dxf_curves_entity(&mut body, &layer, &pts, false, Some(h));
-                        let mut f = feature(
-                            "LineString",
-                            coords_line(curve_points(&layer, &pts, false)),
-                            &layer_props(c.to_layer()),
-                        );
-                        f["properties"]["elevation"] = json!(h);
-                        feats.push(f);
-                        layers.insert(layer);
-                    }
-                }
-                // knoll/depression points come from merged_dotknolls.geojson (see
-                // published_knolls); taking them here as well would publish each twice
-                Geometry::Points(_) => {}
-            }
-        }
-    }
-
-    // the knoll/depression point symbols, already spacing-filtered, with the contours
-    // broken around them above
-    {
-        use std::fmt::Write as _;
-        for (p, kp_layer) in &kept_knolls {
-            let layer = layer_isom(kp_layer).unwrap_or(kp_layer).to_string();
-            grow(&[*p]);
-            let _ = write!(
-                body,
-                "POINT\r\n  8\r\n{layer}\r\n 10\r\n{}\r\n 20\r\n{}\r\n 50\r\n0\r\n  0\r\n",
-                p[0], p[1]
-            );
-            feats.push(feature(
-                "Point",
-                json!([r2(p[0]), r2(p[1])]),
-                &layer_props(kp_layer),
-            ));
-            layers.insert(layer);
-        }
-    }
-
-    // chained cliff lines (dashes clustered per face, sub-minimum faces dropped)
-    for (mids, layer) in [(&cliff_mids_202, "202"), (&cliff_mids_201, "201")] {
-        for chain in chain_cliff_dashes(mids) {
-            grow(&chain);
-            dxf_curves_entity(&mut body, layer, &chain, false, None);
-            feats.push(feature(
-                "LineString",
-                coords_line(curve_points(layer, &chain, false)),
-                &[("layer", layer), ("isom", layer)],
-            ));
-            layers.insert(layer.to_string());
-        }
-    }
-
-    // all merged GeoJSON outputs: polygons become closed polylines, lines stay open
     for out in GEOJSON_OUTPUTS {
-        let name = out.name;
-        // contours and form lines come from merged.dxf.bin (full classification) when it
-        // exists; taking both routes would publish each feature twice
-        if out.skip_when_merged_bin && have_merged_bin {
+        let path = format!("{batchoutfolder}/merged_{}.geojson", out.name);
+        let Some(features) = read_features(fs, Path::new(&path))? else {
             continue;
-        }
-        let path = format!("{batchoutfolder}/merged_{name}.geojson");
-        if !fs.exists(&path) {
-            continue;
-        }
-        let val: Value = serde_json::from_reader(BufReader::new(fs.open(&path)?))?;
-        let empty = Vec::new();
-        for f in val["features"].as_array().unwrap_or(&empty) {
+        };
+        for f in features {
             let props = &f["properties"];
             let layer = props["isom"]
                 .as_str()
                 .or(props["layer"].as_str())
                 .unwrap_or("unknown")
                 .to_string();
-            let coords = &f["geometry"]["coordinates"];
-            // a contour broken around a knoll symbol stays one feature, as several parts
-            let mut retyped: Option<&str> = None;
-            // the GeoJSON gets the same fitted curve as the DXF, sampled to a polyline
-            let sampled: Value = match f["geometry"]["type"].as_str().unwrap_or("") {
-                "LineString" => {
-                    let pieces = published_pieces(&layer, &parse_line(coords), false, &knoll_pts);
-                    let Some((first, rest)) = pieces.split_first() else {
-                        continue; // generalised or broken away entirely
+            let geometry = &f["geometry"];
+            match geometry["type"].as_str().unwrap_or("") {
+                "Point" => {
+                    use std::fmt::Write as _;
+                    let c = &geometry["coordinates"];
+                    let (Some(x), Some(y)) = (c[0].as_f64(), c[1].as_f64()) else {
+                        continue;
                     };
-                    for p in &pieces {
-                        grow(p);
-                        dxf_curves_entity(&mut body, &layer, p, false, None);
-                    }
-                    layers.insert(layer.clone());
-                    if rest.is_empty() {
-                        coords_line(first.clone())
-                    } else {
-                        retyped = Some("MultiLineString");
-                        Value::Array(pieces.into_iter().map(coords_line).collect())
+                    grow(&[[x, y]]);
+                    let _ = write!(
+                        body,
+                        "POINT\r\n  8\r\n{layer}\r\n 10\r\n{x}\r\n 20\r\n{y}\r\n 50\r\n0\r\n  0\r\n"
+                    );
+                }
+                "LineString" | "MultiLineString" => {
+                    for pts in line_parts(geometry) {
+                        grow(&pts);
+                        dxf_curves_entity(
+                            &mut body,
+                            &layer,
+                            &pts,
+                            false,
+                            props["elevation"].as_f64(),
+                        );
                     }
                 }
-                "MultiLineString" => {
-                    let mut parts = Vec::new();
-                    for part in coords.as_array().unwrap_or(&empty) {
-                        for pts in published_pieces(&layer, &parse_line(part), false, &knoll_pts) {
-                            grow(&pts);
-                            dxf_curves_entity(&mut body, &layer, &pts, false, None);
-                            parts.push(coords_line(pts));
-                        }
+                "Polygon" | "MultiPolygon" => {
+                    for pts in polygon_rings(geometry) {
+                        grow(&pts);
+                        dxf_curves_entity(&mut body, &layer, &pts, true, None);
                     }
-                    layers.insert(layer.clone());
-                    Value::Array(parts)
-                }
-                "Polygon" => {
-                    let mut rings = Vec::new();
-                    for ring in coords.as_array().unwrap_or(&empty) {
-                        for pts in published_pieces(&layer, &parse_line(ring), true, &knoll_pts) {
-                            grow(&pts);
-                            dxf_curves_entity(&mut body, &layer, &pts, true, None);
-                            rings.push(coords_line(pts));
-                        }
-                    }
-                    layers.insert(layer.clone());
-                    Value::Array(rings)
                 }
                 _ => continue,
-            };
-            let mut nf = f.clone();
-            nf["geometry"]["coordinates"] = sampled;
-            if let Some(t) = retyped {
-                nf["geometry"]["type"] = json!(t);
             }
-            feats.push(nf);
+            layers.insert(layer);
+            feats.push(f);
         }
     }
 
-    if body.is_empty() {
-        info!("No vector outputs found, skipping combined DXF");
+    if feats.is_empty() {
+        info!("No vector outputs found, skipping combined output");
         return Ok(());
     }
 
     write_feature_collection(
         &mut BufWriter::new(fs.create(format!("{batchoutfolder}/output.geojson"))?),
         &feats,
-        crs(epsg).as_ref(),
+        if wgs84 { None } else { crs(epsg) }.as_ref(),
     )?;
+    if wgs84 {
+        info!("GeoJSON output is WGS84; skipping the projected output.dxf and output.ocdCrt");
+        return Ok(());
+    }
 
     // Bezier curves on organic layers, polylines for roads/buildings; $ACADVER is
     // required for SPLINE entities
@@ -1255,6 +1329,7 @@ pub fn export_combined(
     }
     Ok(())
 }
+
 /// Merge per-tile `<tile>_<name>.geojson` files in the batch output folder into
 /// `merged_<name>.geojson`, one tile parsed at a time.
 pub fn merge_geojson(fs: &impl FileSystem, batchoutfolder: &str) -> anyhow::Result<()> {
@@ -1479,6 +1554,7 @@ mod tests {
             0.0,
             10.0,
             10.0,
+            None,
         )
         .unwrap();
         let val: Value = serde_json::from_reader(fs.open("out.geojson").unwrap()).unwrap();

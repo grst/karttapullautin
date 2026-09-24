@@ -60,6 +60,7 @@ bincode-next = { version = "2.1", default-features = false, features = ["std", "
 
 bytemuck = { version = "1.23", features = ["derive"] }
 itertools = "0.15.0"
+proj4rs = { version = "0.2", default-features = false, features = ["crs-definitions"] }
 
 [build-dependencies]
 typify = "0.8"

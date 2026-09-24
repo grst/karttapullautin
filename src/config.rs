@@ -38,6 +38,9 @@ pub struct Config {
     /// None (key unset) omits the CRS declaration from the output.
     pub epsg: Option<u32>,
 
+    /// Reproject the batch GeoJSON outputs from `epsg` to WGS84 longitude/latitude.
+    pub geojson_wgs84: bool,
+
     pub scalefactor: f64,
     pub vege_bitmode: bool,
     pub zoff: f64,
@@ -197,6 +200,7 @@ impl Config {
         let batchbuffer: f64 = parse_typed(gs, "batchbuffer", 127.0);
         let batchmerge: bool = gs.get("batchmerge").unwrap_or("0") == "1";
         let epsg: Option<u32> = gs.get("epsg").and_then(|s| s.trim().parse().ok());
+        let geojson_wgs84: bool = gs.get("geojson_wgs84").unwrap_or("0") == "1";
         let savetempfiles: bool = gs.get("savetempfiles").unwrap() == "1";
         let savetempfolders: bool = gs.get("savetempfolders").unwrap() == "1";
 
@@ -391,6 +395,13 @@ impl Config {
         let vegeshade: bool = gs.get("vegeshade").unwrap_or("0") == "1";
 
         let batch = gs.get("batch").unwrap() == "1";
+        if geojson_wgs84 && (epsg.is_none() || !batch) {
+            return Err(
+                "`geojson_wgs84=1` needs `epsg` (the CRS to reproject from) and `batch=1`"
+                    .to_string()
+                    .into(),
+            );
+        }
         if batch && processes == 0 {
             return Err(
                 "Value of `processes` cannot be zero if parameter `batch` is 1"
@@ -414,6 +425,7 @@ impl Config {
             batchbuffer,
             batchmerge,
             epsg,
+            geojson_wgs84,
             savetempfolders,
             savetempfiles,
             scalefactor,

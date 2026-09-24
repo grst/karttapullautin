@@ -412,7 +412,13 @@ fn main() {
             pullauta::merge::pngmergevege(&fs, &config, 1.0, false).unwrap();
             pullauta::merge::bindxfmerge(&fs, &config).unwrap();
             pullauta::geojson::merge_geojson(&fs, &config.batchoutfolder).unwrap();
-            pullauta::geojson::export_combined(&fs, config.epsg, &config.batchoutfolder).unwrap();
+            pullauta::geojson::export_combined(
+                &fs,
+                config.epsg,
+                config.geojson_wgs84,
+                &config.batchoutfolder,
+            )
+            .unwrap();
         }
         return;
     }

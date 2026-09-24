@@ -628,6 +628,11 @@ pub fn process_tile(
     } else {
         info!("Skipped rendering");
     }
+    if config.vectorvege {
+        info!("Publishing vector outputs");
+        timing.start_section("publishing vector outputs");
+        crate::geojson::publish_tile(fs, tmpfolder, config.formline, config.epsg).unwrap();
+    }
     info!("All done!");
     Ok(())
 }
@@ -1000,6 +1005,12 @@ pub fn batch_process(
         }
 
         // crop vector GeoJSON outputs (present when vectorvege=1 / an OSM vectorconf is set)
+        let to_wgs84 = if conf.geojson_wgs84 {
+            // config validation guarantees epsg is set
+            Some(crate::geojson::Wgs84::new(conf.epsg.unwrap()).unwrap())
+        } else {
+            None
+        };
         for out in crate::geojson::GEOJSON_OUTPUTS {
             let name = out.name;
             let geojson_file = PathBuf::from(format!("temp{thread}/{name}.geojson"));
@@ -1012,6 +1023,7 @@ pub fn batch_process(
                     miny,
                     maxx,
                     maxy,
+                    to_wgs84.as_ref(),
                 )
                 .unwrap();
             }
