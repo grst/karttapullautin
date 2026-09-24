@@ -499,6 +499,8 @@ fn write_geojson_file(
                 })
                 .collect(),
         );
+        // `layer` is the DXF layer the polygon is written to, which for vegetation is the
+        // ISOM code itself (Classification::Veg*)
         if vegeshade {
             let isom = isom_map
                 .get((*code as usize).saturating_sub(1))
@@ -506,15 +508,16 @@ fn write_geojson_file(
                 .copied()
                 .unwrap_or(410)
                 .to_string();
-            let shade = code.to_string();
+            let mut f = geojson::feature("Polygon", coords, &[("layer", &isom), ("isom", &isom)]);
+            f["properties"]["shade"] = serde_json::json!(code);
+            feats.push(f);
+        } else {
+            let code = code.to_string();
             feats.push(geojson::feature(
                 "Polygon",
                 coords,
-                &[("isom", &isom), ("shade", &shade)],
+                &[("layer", &code), ("isom", &code)],
             ));
-        } else {
-            let code = code.to_string();
-            feats.push(geojson::feature("Polygon", coords, &[("isom", &code)]));
         }
     }
     geojson::write_feature_collection(

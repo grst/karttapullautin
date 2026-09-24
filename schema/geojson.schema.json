@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://karttapullautin.github.io/schema/geojson.schema.json",
   "title": "GeoJSON Output",
+  "description": "One FeatureCollection per output file. Every feature carries `layer` (karttapullautin's own class, the DXF layer name) and `isom` (the ISOM 2017-2 symbol code it is drawn with; OSM codes are those of the vectorconf file). Coordinates are in the input CRS, declared by `crs` when `epsg` is set, or WGS84 without `crs` when `geojson_wgs84=1`.",
   "type": "object",
   "required": ["type", "features"],
   "properties": {
@@ -31,30 +32,31 @@
       "type": "object",
       "required": ["layer", "isom"],
       "properties": {
-        "layer": { "enum": ["101", "102", "103", "105"] },
-        "isom": { "enum": ["101", "102", "103", "105"] },
-        "elevation": { "type": "number" },
-        "depression": { "type": "boolean" },
-        "layer_description": { "type": "string" }
+        "layer": {
+          "enum": [
+            "cont", "contour", "contour_index", "contour_intermed", "contour_index_intermed",
+            "depression", "depression_index", "depression_intermed", "depression_index_intermed",
+            "formline", "formline_depression"
+          ]
+        },
+        "isom": { "enum": ["101", "102", "103"] },
+        "elevation": { "type": "number" }
       }
     },
     "KnollProperties": {
       "type": "object",
       "required": ["layer", "isom"],
       "properties": {
-        "layer": { "enum": ["109", "111"] },
-        "isom": { "enum": ["109", "111"] },
-        "layer_description": { "type": "string" },
-        "ugly": { "type": "boolean" }
+        "layer": { "enum": ["dotknoll", "uglydotknoll", "udepression", "uglyudepression"] },
+        "isom": { "enum": ["109", "111"] }
       }
     },
     "CliffProperties": {
       "type": "object",
       "required": ["layer", "isom"],
       "properties": {
-        "layer": { "enum": ["201", "202"] },
-        "isom": { "enum": ["201", "202"] },
-        "layer_description": { "type": "string" }
+        "layer": { "enum": ["cliff2", "cliff3"] },
+        "isom": { "enum": ["201", "202"] }
       }
     },
     "VegetationProperties": {
@@ -63,19 +65,10 @@
       "properties": {
         "layer": { "enum": ["403", "406", "407", "408", "410"] },
         "isom": { "enum": ["403", "406", "407", "408", "410"] },
-        "shade": { "type": "number" }
+        "shade": { "type": "integer", "minimum": 1 }
       }
     },
-    "OsmLineProperties": {
-      "type": "object",
-      "required": ["layer", "isom", "category"],
-      "properties": {
-        "layer": { "type": "string" },
-        "isom": { "type": "string" },
-        "category": { "type": "string" }
-      }
-    },
-    "OsmAreaProperties": {
+    "OsmProperties": {
       "type": "object",
       "required": ["layer", "isom", "category"],
       "properties": {
@@ -93,7 +86,9 @@
           "type": "object",
           "required": ["type", "coordinates"],
           "properties": {
-            "type": { "enum": ["Point", "LineString", "Polygon"] },
+            "type": {
+              "enum": ["Point", "LineString", "MultiLineString", "Polygon", "MultiPolygon"]
+            },
             "coordinates": { "type": "array" }
           }
         },
@@ -103,8 +98,7 @@
             { "$ref": "#/$defs/KnollProperties" },
             { "$ref": "#/$defs/CliffProperties" },
             { "$ref": "#/$defs/VegetationProperties" },
-            { "$ref": "#/$defs/OsmLineProperties" },
-            { "$ref": "#/$defs/OsmAreaProperties" }
+            { "$ref": "#/$defs/OsmProperties" }
           ]
         }
       }

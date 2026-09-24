@@ -1176,7 +1176,11 @@ pub fn publish_tile(
                 }
                 properties["isom"] = json!("101");
             }
-            let isom = properties["isom"].as_str().unwrap_or_default().to_string();
+            // a class without a symbol of its own (slope lines, the knoll detector's
+            // 1010) is part of the rendering, not a feature of the map
+            let Some(isom) = properties["isom"].as_str().map(str::to_string) else {
+                continue;
+            };
             let pieces = line_parts(&f["geometry"])
                 .iter()
                 .flat_map(|pts| {
@@ -1619,38 +1623,109 @@ mod tests {
         assert_eq!(feats[0]["properties"]["isom"], "101");
     }
 
+    /// Everything `publish_tile` writes must deserialize into the types generated from
+    /// `schema/geojson.schema.json`: the schema is the contract consumers build on.
     #[test]
-    fn generated_types_roundtrip_to_featurecollection_json() {
-        use geojson_types::{
-            ContourProperties, ContourPropertiesIsom, ContourPropertiesLayer, Feature,
-            FeatureGeometry, FeatureGeometryType, FeatureProperties, GeoJsonOutput,
+    fn published_tile_matches_schema() {
+        use crate::geometry::{
+            BinaryDxf, Bounds, Classification, Geometry, Point2, Point3, Points, Polylines,
+        };
+        use std::path::PathBuf;
+
+        let fs = crate::io::fs::memory::MemoryFileSystem::new();
+        let bounds = Bounds::new(0.0, 200.0, 0.0, 200.0);
+        let line = |y: f64| -> Vec<Point2> {
+            (0..100)
+                .map(|i| Point2::new(f64::from(i) * 2.0, y))
+                .collect()
+        };
+        let write = |name: &str, geometry: Geometry| {
+            let dxf = BinaryDxf::new(bounds.clone(), vec![geometry]);
+            dxf.to_writer(&mut fs.create(format!("{name}.dxf.bin")).unwrap())
+                .unwrap();
+            bindxf_to_geojson(
+                &fs,
+                &[PathBuf::from(format!("{name}.dxf.bin"))],
+                Path::new(&format!("{name}.geojson")),
+                Some(25832),
+            )
+            .unwrap();
         };
 
-        let contour = ContourProperties {
-            depression: None,
-            elevation: None,
-            isom: ContourPropertiesIsom::X101,
-            layer: ContourPropertiesLayer::X101,
-            layer_description: None,
+        let line3 = |y: f64| -> Vec<Point3> {
+            line(y).iter().map(|p| Point3::new(p.x, p.y, 0.0)).collect()
         };
-        let feature = Feature {
-            geometry: FeatureGeometry {
-                coordinates: vec![serde_json::json!(0.0), serde_json::json!(0.0)],
-                type_: FeatureGeometryType::Point,
-            },
-            properties: FeatureProperties::ContourProperties(contour),
-            type_: serde_json::json!("Feature"),
-        };
-        let collection = GeoJsonOutput {
-            crs: None,
-            features: vec![feature],
-            type_: serde_json::json!("FeatureCollection"),
-        };
+        let mut contours = Polylines::new();
+        contours.push(line3(10.0), (Classification::Contour, 500.0));
+        contours.push(line3(20.0), (Classification::ContourIndex, 525.0));
+        contours.push(line3(30.0), (Classification::ContourIntermed, 502.5));
+        write("contours", Geometry::Polylines3(contours));
 
-        let json = serde_json::to_value(&collection).unwrap();
-        assert_eq!(json["type"], "FeatureCollection");
-        assert!(json["features"].is_array());
-        assert_eq!(json["features"][0]["type"], "Feature");
-        assert_eq!(json["features"][0]["properties"]["isom"], "101");
+        let mut formlines = Polylines::new();
+        formlines.push(line(40.0), Classification::Formline);
+        write("formlines", Geometry::Polylines2(formlines));
+
+        let mut knolls = Points::new();
+        knolls.push(Point2::new(100.0, 100.0), Classification::Dotknoll);
+        knolls.push(Point2::new(105.0, 100.0), Classification::UglyDotknoll);
+        knolls.push(Point2::new(150.0, 150.0), Classification::Udepression);
+        write("dotknolls", Geometry::Points(knolls));
+
+        let mut cliffs = Polylines::new();
+        for i in 0..10 {
+            let x = f64::from(i) * 2.0;
+            cliffs.push(
+                vec![Point2::new(x, 60.0), Point2::new(x, 61.0)],
+                Classification::Cliff3,
+            );
+        }
+        write("cliffs", Geometry::Polylines2(cliffs));
+
+        publish_tile(&fs, Path::new(""), 2.0, Some(25832)).unwrap();
+
+        for name in ["contours", "formlines", "dotknolls", "cliffs"] {
+            let val: Value =
+                serde_json::from_reader(fs.open(format!("{name}.geojson")).unwrap()).unwrap();
+            assert!(
+                !val["features"].as_array().unwrap().is_empty(),
+                "{name}: nothing published"
+            );
+            if let Err(e) = serde_json::from_value::<geojson_types::GeoJsonOutput>(val.clone()) {
+                panic!("{name} does not match the schema: {e}\n{val}");
+            }
+        }
+
+        let contours: Value =
+            serde_json::from_reader(fs.open("contours.geojson").unwrap()).unwrap();
+        let layers: Vec<&str> = contours["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["properties"]["layer"].as_str().unwrap())
+            .collect();
+        assert!(
+            !layers.contains(&"contour_intermed"),
+            "formline=2 must leave half-interval candidates to the form lines: {layers:?}"
+        );
+        let knolls: Value = serde_json::from_reader(fs.open("dotknolls.geojson").unwrap()).unwrap();
+        assert_eq!(
+            knolls["features"].as_array().unwrap().len(),
+            2,
+            "the uncertain knoll 5 m from a certain one must give way"
+        );
+    }
+
+    #[test]
+    fn wgs84_reprojects_a_utm_position() {
+        let w = Wgs84::new(25832).unwrap();
+        // Immenstadt im Allgäu, ETRS89 / UTM 32N
+        let [lon, lat] = w.point([593_500.0, 5_269_500.0]).unwrap();
+        assert!(
+            (lon - 10.247).abs() < 0.01 && (lat - 47.567).abs() < 0.01,
+            "{lon} {lat}"
+        );
+        let mut g = json!({"type": "LineString", "coordinates": [[593_500.0, 5_269_500.0], [593_600.0, 5_269_500.0]]});
+        w.geometry(&mut g).unwrap();
+        assert_eq!(g["coordinates"][0], json!([lon, lat]));
     }
 }
