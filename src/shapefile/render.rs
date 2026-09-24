@@ -693,6 +693,23 @@ pub fn render(
                         // A shapefile polygon may hold several outer rings, each followed by
                         // its holes; GeoJSON reads every ring after the first as a hole, so
                         // each outer ring becomes a polygon of its own.
+                        // The renderer strokes some areas with a black border (a lake's bank,
+                        // a field's edge). As a line of its own, so that it follows the shape
+                        // and not the tile edge a cropped polygon also has: `<code>.1`, the
+                        // convention the rules file already uses for 301.1 and 529.1.
+                        if border > 0.0 {
+                            geo_lines.push((
+                                format!("{}.1", m.isom),
+                                m.description.clone(),
+                                polygon
+                                    .rings()
+                                    .iter()
+                                    .map(|ring| {
+                                        ring.points().iter().map(|pt| [pt.x, pt.y]).collect()
+                                    })
+                                    .collect(),
+                            ));
+                        }
                         let first = geo_areas.len();
                         for ring in polygon.rings() {
                             let pts = ring.points().iter().map(|pt| [pt.x, pt.y]).collect();
