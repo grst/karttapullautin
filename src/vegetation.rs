@@ -715,7 +715,11 @@ pub fn makevege(
             for y in 0..h_block_step {
                 let ug_entry = &ug[(x, y)];
                 let value = ug_entry.ug as f64 / (ug_entry.ug as f64 + ug_entry.ugg as f64 + 0.01);
-                if value > uglimit {
+                // the two densities the rendered map draws: two stripes per cell above
+                // `undergrowth`, a third one in between above `undergrowth2`
+                if value > uglimit2 {
+                    ug_class[(x, y)] = 2;
+                } else if value > uglimit {
                     ug_class[(x, y)] = 1;
                 }
             }

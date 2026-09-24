@@ -46,6 +46,7 @@ fn isom_to_class(isom: u16) -> Classification {
         406 => Classification::Veg406,
         407 => Classification::Veg407,
         408 => Classification::Veg408,
+        409 => Classification::Veg409,
         _ => Classification::Veg410,
     }
 }
@@ -592,7 +593,15 @@ pub fn export_all(
         yellow_med,
         eps,
     );
-    let ug_polys = grid_to_polygons(ug, (xmin, ymin), block * 6.0, &|_| 407, [0, 0], eps);
+    // 407 slow running / 409 walk, both "good visibility": undergrowth, and dense undergrowth
+    let ug_polys = grid_to_polygons(
+        ug,
+        (xmin, ymin),
+        block * 6.0,
+        &|c| if c == 2 { 409 } else { 407 },
+        [0, 0],
+        eps,
+    );
 
     write_geojson_file(
         fs,
@@ -634,7 +643,7 @@ pub fn export_all(
     };
     let order = |code: u16| -> usize {
         let mapped = isom_of(code);
-        [403u16, 406, 408, 410, 407]
+        [403u16, 406, 408, 410, 407, 409]
             .iter()
             .position(|&c| c == mapped)
             .unwrap_or(5)

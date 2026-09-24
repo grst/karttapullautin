@@ -362,6 +362,7 @@ pub enum Classification {
     Veg407,
     Veg408,
     Veg410,
+    Veg409,
 }
 
 impl Classification {
@@ -401,6 +402,7 @@ impl Classification {
             Self::Veg407 => "407",
             Self::Veg408 => "408",
             Self::Veg410 => "410",
+            Self::Veg409 => "409",
         }
     }
 
@@ -408,7 +410,7 @@ impl Classification {
     pub fn is_area(&self) -> bool {
         matches!(
             self,
-            Self::Veg403 | Self::Veg406 | Self::Veg407 | Self::Veg408 | Self::Veg410
+            Self::Veg403 | Self::Veg406 | Self::Veg407 | Self::Veg408 | Self::Veg409 | Self::Veg410
         )
     }
 
