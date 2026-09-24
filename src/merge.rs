@@ -435,6 +435,52 @@ fn decorate_depression(
     ))
 }
 
+/// Whether a contour at height `h` runs with the lower ground on its left: a vote over its
+/// segments, each comparing the height half a grid cell to its right against `h`.
+fn downhill_on_left(
+    xyz: &Vec2D<f64>,
+    xstart: f64,
+    ystart: f64,
+    size: f64,
+    x: &[f64],
+    y: &[f64],
+    h: f64,
+) -> bool {
+    if h.is_nan() {
+        return false;
+    }
+    // bilinear height at a world position, clamped to the grid
+    let height = |wx: f64, wy: f64| -> f64 {
+        let gx = ((wx - xstart) / size).clamp(0.0, (xyz.width() - 1) as f64);
+        let gy = ((wy - ystart) / size).clamp(0.0, (xyz.height() - 1) as f64);
+        let (ix, iy) = (
+            (gx.floor() as usize).min(xyz.width().saturating_sub(2)),
+            (gy.floor() as usize).min(xyz.height().saturating_sub(2)),
+        );
+        let (fx, fy) = (gx - ix as f64, gy - iy as f64);
+        let a = xyz[(ix, iy)] * (1.0 - fx) + xyz[(ix + 1, iy)] * fx;
+        let b = xyz[(ix, iy + 1)] * (1.0 - fx) + xyz[(ix + 1, iy + 1)] * fx;
+        a * (1.0 - fy) + b * fy
+    };
+    let mut vote = 0i64;
+    for k in 0..x.len().saturating_sub(1) {
+        let (dx, dy) = (x[k + 1] - x[k], y[k + 1] - y[k]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len == 0.0 {
+            continue;
+        }
+        // the right-hand normal of the direction of travel
+        let (nx, ny) = (dy / len * size * 0.5, -dx / len * size * 0.5);
+        let (mx, my) = ((x[k] + x[k + 1]) / 2.0, (y[k] + y[k + 1]) / 2.0);
+        if height(mx + nx, my + ny) > h {
+            vote += 1;
+        } else {
+            vote -= 1;
+        }
+    }
+    vote > 0
+}
+
 pub fn smoothjoin(
     fs: &impl FileSystem,
     config: &Config,
@@ -689,34 +735,46 @@ pub fn smoothjoin(
                 // not skipped, lets save first coordinate pair for later form line knoll PIP analysis
                 write!(&mut knollhead_fp, "{} {}\r\n", el_x[l][0], el_y[l][0])
                     .expect("Unable to write to file");
+                // One direction for every contour, downhill on the right. The tracer's direction
+                // depends on where it happened to start, so the same contour can run either way
+                // in two tiles that share it -- and the smoothing below is not symmetric, so it
+                // then comes out differently on the two sides of the tile edge. A fixed
+                // direction also tells a consumer which side is downhill, which is what a slope
+                // line on a depression needs.
+                if downhill_on_left(&xyz, xstart, ystart, size, &el_x[l], &el_y[l], h) {
+                    el_x[l].reverse();
+                    el_y[l].reverse();
+                }
                 // adaptive generalization
                 if el_x_len > 101 {
                     let mut newx: Vec<f64> = vec![];
                     let mut newy: Vec<f64> = vec![];
-                    let mut xpre = el_x[l][0];
-                    let mut ypre = el_y[l][0];
-
                     newx.push(el_x[l][0]);
                     newy.push(el_y[l][0]);
 
+                    // On flat ground a vertex is kept where the line enters a new 4 m cell of a
+                    // fixed world grid. The spacing is the same ~4 m a "4 m from the last kept
+                    // vertex" walk gives, but the choice depends on where the vertex is and not
+                    // on where the walk started -- which differs between two tiles that share
+                    // the line, and used to leave their halves visibly apart at the tile edge.
+                    let cell4 = |k: usize| {
+                        (
+                            (el_x[l][k] / 4.0).floor() as i64,
+                            (el_y[l][k] / 4.0).floor() as i64,
+                        )
+                    };
                     for k in 1..(el_x_len - 1) {
                         let xx = ((el_x[l][k] - xstart) / size + 0.5) as usize;
                         let yy = ((el_y[l][k] - ystart) / size + 0.5) as usize;
                         let ss = steepness[(xx, yy)];
                         if ss.is_nan() || ss < 0.5 {
-                            if ((xpre - el_x[l][k]).powi(2) + (ypre - el_y[l][k]).powi(2)).sqrt()
-                                >= 4.0
-                            {
+                            if cell4(k) != cell4(k - 1) {
                                 newx.push(el_x[l][k]);
                                 newy.push(el_y[l][k]);
-                                xpre = el_x[l][k];
-                                ypre = el_y[l][k];
                             }
                         } else {
                             newx.push(el_x[l][k]);
                             newy.push(el_y[l][k]);
-                            xpre = el_x[l][k];
-                            ypre = el_y[l][k];
                         }
                     }
                     newx.push(el_x[l][el_x_len - 1]);
