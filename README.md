@@ -123,6 +123,16 @@ In additon to the png raster map imges, Karttapullautin makes also vector contou
 - `c2g.dxf`: big cliffs
 - `vegetation.png + vegetation.pgw`: generalized green/yellow as raster, same as at the background of final map png files.
 
+#### GeoJSON
+
+With `vectorvege=1` Karttapullautin also writes the map as GeoJSON, one `FeatureCollection` per layer: `contours`, `formlines`, `dotknolls`, `cliffs`, `vegetation`, `yellow`, `undergrowth`, and, when a `vectorconf` is set, `osm_lines` and `osm_areas`. In batch mode they are cropped per tile to `<tile>_<layer>.geojson` in the output folder. They are the published map rather than the raw detector output: contours are generalised and broken around the knoll symbols, the cliff dashes are chained into cliff lines, and the vegetation is traced into polygons.
+
+Every feature carries `layer` (Karttapullautin's own class, the DXF layer name) and `isom` (the ISOM 2017-2 symbol code, or for the shapefile features the code from the `vectorconf` file); contours also carry `elevation`. The property schema is `schema/geojson.schema.json`.
+
+Coordinates are in the input CRS; set `epsg` to declare it in the files. With `geojson_wgs84=1` (batch mode, `epsg` required) the per-tile files are instead reprojected to WGS84 longitude/latitude, which is what tools such as [tippecanoe](https://github.com/felt/tippecanoe) read, so they can go straight into a vector tile pyramid:
+
+    tippecanoe -e tiles -L contours:out/593_5269_contours.geojson -L vegetation:out/593_5269_vegetation.geojson ...
+
 For importing Maastotietokanta, try reading shape filed directly to your mapping app. Note that the `dxf` files need to be converted from the internal `.bin.dxf` format using the command `bin2dxf` as mentioned above.
 
 ### Batch processing
