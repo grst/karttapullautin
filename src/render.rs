@@ -524,6 +524,10 @@ pub fn draw_curves(
 
     let should_generate_formlines = formline == 2.0 && !nodepressions;
     let mut formlines = Polylines::<Point2, Classification>::new();
+    // whether each form line lies on a depression, whatever `label_depressions` says: the
+    // rendered map draws those in the depression colour, and the vector output has to be able
+    // to tell them apart as well
+    let mut formline_on_depression = Vec::<bool>::new();
 
     let mut last_curve_drawn = false;
     let mut should_draw_next_slope_line = true;
@@ -927,18 +931,31 @@ pub fn draw_curves(
                 } else if !formiline_points.is_empty() {
                     // line ended, append and start new one
                     formlines.push(formiline_points, f_label);
+                    formline_on_depression.push(layer.is_depression());
                     formiline_points = Vec::new();
                 }
             }
 
             if !formiline_points.is_empty() {
                 formlines.push(formiline_points, f_label);
+                formline_on_depression.push(layer.is_depression());
             }
         }
     }
 
     if should_generate_formlines {
-        let out_formlines = BinaryDxf::new(bounds, vec![formlines.into()]);
+        let mut vector_formlines = Polylines::<Point2, Classification>::new();
+        if config.vectorvege {
+            for ((line, _), &depression) in formlines.iter().zip(&formline_on_depression) {
+                let class = if depression {
+                    Classification::FormlineDepression
+                } else {
+                    Classification::Formline
+                };
+                vector_formlines.push(line.clone(), class);
+            }
+        }
+        let out_formlines = BinaryDxf::new(bounds.clone(), vec![formlines.into()]);
         out_formlines
             .to_writer(&mut fs.create(tmpfolder.join("formlines.dxf.bin"))?)
             .expect("Could not write formlines.dxf.bin");
@@ -954,9 +971,9 @@ pub fn draw_curves(
         // path contours already take (GEOJSON_OUTPUTS). Written in every run mode
         // because the selection is the same in all of them.
         if config.vectorvege {
-            crate::geojson::bindxf_to_geojson(
+            crate::geojson::dxfs_to_geojson(
                 fs,
-                &[tmpfolder.join("formlines.dxf.bin")],
+                vec![BinaryDxf::new(bounds, vec![vector_formlines.into()])],
                 &tmpfolder.join("formlines.geojson"),
                 config.epsg,
             )?;

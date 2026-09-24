@@ -182,6 +182,7 @@ fn layer_isom(layer: &str) -> Option<&'static str> {
         "406" => "406",
         "407" => "407",
         "408" => "408",
+        "409" => "409",
         "410" => "410",
         _ => return None,
     })
@@ -207,9 +208,22 @@ pub fn bindxf_to_geojson(
     output: &std::path::Path,
     epsg: Option<u32>,
 ) -> anyhow::Result<()> {
+    let dxfs = inputs
+        .iter()
+        .map(|input| BinaryDxf::from_reader(&mut fs.open(input)?))
+        .collect::<Result<Vec<_>, _>>()?;
+    dxfs_to_geojson(fs, dxfs, output, epsg)
+}
+
+/// [`bindxf_to_geojson`] for geometry already in memory.
+pub fn dxfs_to_geojson(
+    fs: &impl FileSystem,
+    dxfs: Vec<BinaryDxf>,
+    output: &std::path::Path,
+    epsg: Option<u32>,
+) -> anyhow::Result<()> {
     let mut feats = Vec::new();
-    for input in inputs {
-        let dxf = BinaryDxf::from_reader(&mut fs.open(input)?)?;
+    for dxf in dxfs {
         for geom in dxf.take_geometry() {
             match geom {
                 Geometry::Polylines2(pl) => {
@@ -519,7 +533,18 @@ pub fn crop_geojson(
 fn curve_layer(layer: &str) -> bool {
     matches!(
         layer,
-        "101" | "102" | "103" | "201" | "202" | "306" | "403" | "406" | "407" | "408" | "410"
+        "101"
+            | "102"
+            | "103"
+            | "201"
+            | "202"
+            | "306"
+            | "403"
+            | "406"
+            | "407"
+            | "408"
+            | "409"
+            | "410"
     )
 }
 
@@ -574,35 +599,6 @@ fn fit_bezier(pts: &[[f64; 2]], closed: bool) -> Option<Vec<[f64; 2]>> {
     }
     ctrl.push(p[n - 1]);
     Some(ctrl)
-}
-
-/// The polyline a GeoJSON feature gets for a curve layer: the same fitted Bezier the
-/// DXF SPLINE uses, densely sampled (GeoJSON has no curve geometry). Non-curve layers
-/// and too-short lines pass through unchanged.
-fn curve_points(layer: &str, pts: &[[f64; 2]], closed: bool) -> Vec<[f64; 2]> {
-    if !(curve_layer(layer) && pts.len() > 3) {
-        return pts.to_vec();
-    }
-    let Some(ctrl) = fit_bezier(pts, closed) else {
-        return pts.to_vec();
-    };
-    const SAMPLES: usize = 8; // per Bezier segment; segments are >= 1 m after thinning
-    let segs = (ctrl.len() - 1) / 3;
-    let mut out = Vec::with_capacity(segs * SAMPLES + 1);
-    out.push(ctrl[0]);
-    for s in 0..segs {
-        let c = &ctrl[3 * s..3 * s + 4];
-        for k in 1..=SAMPLES {
-            let t = k as f64 / SAMPLES as f64;
-            let u = 1.0 - t;
-            let (b0, b1, b2, b3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
-            out.push([
-                b0 * c[0][0] + b1 * c[1][0] + b2 * c[2][0] + b3 * c[3][0],
-                b0 * c[0][1] + b1 * c[1][1] + b2 * c[2][1] + b3 * c[3][1],
-            ]);
-        }
-    }
-    out
 }
 
 /// Write one SPLINE entity from the fitted piecewise cubic Bezier (see [`fit_bezier`]).
@@ -671,12 +667,6 @@ fn dxf_polyline(out: &mut String, layer: &str, pts: &[[f64; 2]], closed: bool, e
     out.push_str("SEQEND\r\n  0\r\n");
 }
 
-/// Combine every merged vector output in the batch folder into a single `merged_all.dxf`
-/// (layer names = ISOM codes where known) plus a `merged_all.ocdCrt` cross-reference
-/// table for OCAD's "Import DXF" layer-to-symbol conversion.
-/// ISOM 202: minimum cliff length 0.6 mm => 9 m footprint at 1:10,000 (applied to 201
-/// as well). Shorter detector fragments are noise, not mappable cliffs.
-const CLIFF_MIN_LEN_M: f64 = 9.0;
 /// KP emits one ~3 m dash per detected steep cell; dashes within this distance belong
 /// to the same cliff face.
 const CLIFF_CLUSTER_DIST: f64 = 3.0;
@@ -750,7 +740,22 @@ fn generalise_contour(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
         }
         i = jump.unwrap_or(i + 1);
     }
+    // A closed ring is a knoll or a depression in its own right -- karttapullautin lifted
+    // the ground under a small knoll precisely so that it earns one -- and a ring narrower
+    // than the minimum mouth would otherwise be spliced across into a single line. A splice
+    // that takes a noticeable part of a ring's area is not a wobble, so such a ring stays.
+    if pts.first() == pts.last() && ring_area(&out).abs() < 0.9 * ring_area(pts).abs() {
+        return pts.to_vec();
+    }
     out
+}
+
+/// Signed area of a ring (shoelace; positive counter-clockwise).
+fn ring_area(pts: &[[f64; 2]]) -> f64 {
+    pts.windows(2)
+        .map(|w| w[0][0] * w[1][1] - w[1][0] * w[0][1])
+        .sum::<f64>()
+        / 2.0
 }
 
 /// ISOM 2017-2 requires that symbol 109/110 "shall not touch or overlap contours", and
@@ -805,62 +810,48 @@ fn conform_contour(layer: &str, pts: &[[f64; 2]], knolls: &[[f64; 2]]) -> Vec<Ve
     break_at_knolls(&generalise_contour(pts), knolls)
 }
 
-/// The pieces of one line as published: ISOM-conformed, curve-sampled, then re-checked
-/// against the knolls — fitting a curve through a broken end bows it back over the very
-/// symbol the break was made for (measured: 2.95 m from a symbol of 3 m radius).
-fn published_pieces(
-    layer: &str,
-    pts: &[[f64; 2]],
-    closed: bool,
-    knolls: &[[f64; 2]],
-) -> Vec<Vec<[f64; 2]>> {
+/// The pieces of one line as published: generalised to the ISOM minimums and broken around
+/// the knoll symbols. No curve is fitted: the line is karttapullautin's own smoothed contour,
+/// the one the rendered map draws, and a fit that depends on the whole line (a
+/// Douglas-Peucker thinning, say) would come out differently in the two tiles that share it.
+fn published_pieces(layer: &str, pts: &[[f64; 2]], knolls: &[[f64; 2]]) -> Vec<Vec<[f64; 2]>> {
     conform_contour(layer, pts, knolls)
-        .into_iter()
-        .flat_map(|piece| {
-            let still_closed = closed && piece.first() == piece.last();
-            let sampled = curve_points(layer, &piece, still_closed);
-            if is_contour_family(layer) {
-                break_at_knolls(&sampled, knolls)
-            } else {
-                vec![sampled]
-            }
-        })
-        .collect()
 }
 
-/// Chain KP's per-cell cliff dashes into cliff lines: cluster dash midpoints within
-/// CLIFF_CLUSTER_DIST, order each cluster as a greedy nearest-neighbour path from an
-/// extreme point refined with 2-opt (untangles the crossings greedy ordering leaves on
-/// sharply curved faces), and drop chains shorter than the ISOM minimum.
-fn chain_cliff_dashes(mids: &[[f64; 2]]) -> Vec<Vec<[f64; 2]>> {
+/// Groups of points that lie within CLIFF_CLUSTER_DIST of each other, transitively (a
+/// union-find over a grid of that size), each group in ascending index order and the groups
+/// in order of their first point.
+fn cluster_points(mids: &[[f64; 2]]) -> Vec<Vec<usize>> {
     use std::collections::HashMap;
-    // union-find over a coarse grid
     let mut parent: Vec<usize> = (0..mids.len()).collect();
-    fn find(parent: &mut Vec<usize>, i: usize) -> usize {
-        if parent[i] != i {
-            let r = find(parent, parent[i]);
-            parent[i] = r;
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while parent[r] != r {
+            r = parent[r];
         }
-        parent[i]
+        let mut c = i;
+        while parent[c] != r {
+            let next = parent[c];
+            parent[c] = r;
+            c = next;
+        }
+        r
     }
     let cell = CLIFF_CLUSTER_DIST;
+    let key = |m: &[f64; 2]| ((m[0] / cell).floor() as i64, (m[1] / cell).floor() as i64);
     let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
     for (i, m) in mids.iter().enumerate() {
-        grid.entry(((m[0] / cell) as i64, (m[1] / cell) as i64))
-            .or_default()
-            .push(i);
+        grid.entry(key(m)).or_default().push(i);
     }
     for (i, m) in mids.iter().enumerate() {
-        let (gx, gy) = ((m[0] / cell) as i64, (m[1] / cell) as i64);
+        let (gx, gy) = key(m);
         for dx in -1..=1 {
             for dy in -1..=1 {
-                if let Some(others) = grid.get(&(gx + dx, gy + dy)) {
-                    for &j in others {
-                        if j > i && dist(*m, mids[j]) <= CLIFF_CLUSTER_DIST {
-                            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-                            if ri != rj {
-                                parent[ri] = rj;
-                            }
+                for &j in grid.get(&(gx + dx, gy + dy)).into_iter().flatten() {
+                    if j > i && dist(*m, mids[j]) <= CLIFF_CLUSTER_DIST {
+                        let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                        if ri != rj {
+                            parent[ri.max(rj)] = ri.min(rj);
                         }
                     }
                 }
@@ -872,138 +863,66 @@ fn chain_cliff_dashes(mids: &[[f64; 2]]) -> Vec<Vec<[f64; 2]>> {
         let r = find(&mut parent, i);
         clusters.entry(r).or_default().push(i);
     }
-
-    // in order of each cluster's first dash, so the output does not depend on hashing
     let mut clusters: Vec<Vec<usize>> = clusters.into_values().collect();
     clusters.sort_unstable_by_key(|members| members[0]);
-    log::debug!(
-        "cliff clusters: {} from {} dashes, largest {}",
-        clusters.len(),
-        mids.len(),
-        clusters.iter().map(Vec::len).max().unwrap_or(0)
-    );
-    let mut used = vec![false; mids.len()];
-    let mut chains = Vec::new();
-    for members in &clusters {
-        // start from the point farthest from the cluster centroid
-        let n = members.len() as f64;
-        let cx = members.iter().map(|&i| mids[i][0]).sum::<f64>() / n;
-        let cy = members.iter().map(|&i| mids[i][1]).sum::<f64>() / n;
-        let start = *members
-            .iter()
-            .max_by(|a, b| {
-                dist(mids[**a], [cx, cy])
-                    .partial_cmp(&dist(mids[**b], [cx, cy]))
-                    .unwrap()
+    clusters
+}
+
+/// A cliff dash, as its two end points.
+type Dash = [[f64; 2]; 2];
+
+/// Two dashes whose midpoints fall in the same cell of this size and whose directions in the
+/// same bin of CLIFF_DEDUP_DEG are one stroke on the map: the rendered cliff is drawn
+/// 2.5 m wide, and the detector marks most places several times over (on alpine terrain
+/// four dashes in five are such repeats).
+const CLIFF_DEDUP_M: f64 = 0.5;
+const CLIFF_DEDUP_DEG: f64 = 15.0;
+
+/// The cliff faces of a set of dashes: repeats dropped (see CLIFF_DEDUP_M), the rest grouped
+/// into faces by CLIFF_CLUSTER_DIST. The dashes themselves are kept, not replaced by a line
+/// through them: they *are* the symbol the rendered map draws, and a dense rock area is not
+/// a line. Which of two repeats survives depends only on the dashes themselves, and so does
+/// every grouping, so two tiles sharing a stretch of rock publish the same dashes for it.
+fn cliff_faces(dashes: &[Dash]) -> Vec<Vec<Dash>> {
+    use std::collections::HashMap;
+    let mut kept: HashMap<(i64, i64, i64), Dash> = HashMap::new();
+    for d in dashes {
+        let [a, b] = *d;
+        // one direction for both ways a dash can be written down
+        let d = if (a[0], a[1]) <= (b[0], b[1]) {
+            [a, b]
+        } else {
+            [b, a]
+        };
+        let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        let angle = (d[1][1] - d[0][1])
+            .atan2(d[1][0] - d[0][0])
+            .to_degrees()
+            .rem_euclid(180.0);
+        let bins = (180.0 / CLIFF_DEDUP_DEG) as i64;
+        let key = (
+            (mid[0] / CLIFF_DEDUP_M).floor() as i64,
+            (mid[1] / CLIFF_DEDUP_M).floor() as i64,
+            ((angle / CLIFF_DEDUP_DEG).floor() as i64).rem_euclid(bins),
+        );
+        kept.entry(key)
+            .and_modify(|k| {
+                if d.as_flattened() < k.as_flattened() {
+                    *k = d;
+                }
             })
-            .unwrap();
-        // this cluster's own index, so the walk cannot step into a neighbouring cluster
-        let mut local: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
-        for &i in members {
-            let m = mids[i];
-            local
-                .entry(((m[0] / cell) as i64, (m[1] / cell) as i64))
-                .or_default()
-                .push(i);
-        }
-        used[start] = true;
-        let mut path = vec![mids[start]];
-        for _ in 1..members.len() {
-            let next = nearest_unused(mids, &local, &used, *path.last().unwrap(), cell);
-            used[next] = true;
-            path.push(mids[next]);
-        }
-        two_opt(&mut path);
-        // A dense rock area is one cluster but no single line: a greedy walk across it
-        // jumps between strands. Break it there rather than draw the jumps.
-        let mut pieces: Vec<Vec<[f64; 2]>> = vec![Vec::new()];
-        for p in path {
-            let piece = pieces.last_mut().unwrap();
-            if piece.last().is_some_and(|q| dist(*q, p) > CLIFF_MAX_STEP_M) {
-                pieces.push(vec![p]);
-            } else {
-                piece.push(p);
-            }
-        }
-        for piece in pieces {
-            let len: f64 = piece.windows(2).map(|w| dist(w[0], w[1])).sum();
-            // single-dash clusters have zero path length; use the dash length itself
-            if len.max(2.9) >= CLIFF_MIN_LEN_M {
-                chains.push(piece);
-            }
-        }
+            .or_insert(d);
     }
-    chains
-}
-
-/// A step between two chained dashes longer than this is a jump between strands of the
-/// same rock area, not a continuation of one cliff line.
-const CLIFF_MAX_STEP_M: f64 = 2.0 * CLIFF_CLUSTER_DIST;
-
-/// The unused point nearest to `from`, searching the `cell`-sized grid in rings of cells
-/// outward. Assumes an unused point exists.
-fn nearest_unused(
-    mids: &[[f64; 2]],
-    grid: &std::collections::HashMap<(i64, i64), Vec<usize>>,
-    used: &[bool],
-    from: [f64; 2],
-    cell: f64,
-) -> usize {
-    let (gx, gy) = ((from[0] / cell) as i64, (from[1] / cell) as i64);
-    let mut best: Option<(f64, usize)> = None;
-    for r in 0i64.. {
-        // every point in ring r is at least (r - 1) cells away
-        if best.is_some_and(|(d, _)| d <= (r - 1) as f64 * cell) {
-            break;
-        }
-        for dx in -r..=r {
-            for dy in -r..=r {
-                if dx.abs() != r && dy.abs() != r {
-                    continue; // inside the ring, already searched
-                }
-                for &j in grid.get(&(gx + dx, gy + dy)).into_iter().flatten() {
-                    let d = dist(mids[j], from);
-                    if !used[j] && best.is_none_or(|(b, _)| d < b) {
-                        best = Some((d, j));
-                    }
-                }
-            }
-        }
-    }
-    best.unwrap().1
-}
-
-/// 2-opt on an open path: reversing path[i+1..=j] swaps edges (i,i+1)/(j,j+1) for
-/// (i,j)/(i+1,j+1); when j is the last point only edge (i,i+1) is replaced. It untangles
-/// the crossings greedy ordering leaves on sharply curved faces. Moves are limited to a
-/// window along the path, which is where those crossings are, so a rock area of tens of
-/// thousands of dashes stays linear rather than cubic.
-fn two_opt(path: &mut [[f64; 2]]) {
-    const WINDOW: usize = 64;
-    const MAX_PASSES: usize = 20;
-    let n = path.len();
-    for _ in 0..MAX_PASSES {
-        let mut improved = false;
-        for i in 0..n.saturating_sub(2) {
-            for j in i + 2..n.min(i + WINDOW) {
-                let (removed, added) = if j + 1 < n {
-                    (
-                        dist(path[i], path[i + 1]) + dist(path[j], path[j + 1]),
-                        dist(path[i], path[j]) + dist(path[i + 1], path[j + 1]),
-                    )
-                } else {
-                    (dist(path[i], path[i + 1]), dist(path[i], path[j]))
-                };
-                if added + 1e-9 < removed {
-                    path[i + 1..=j].reverse();
-                    improved = true;
-                }
-            }
-        }
-        if !improved {
-            break;
-        }
-    }
+    let mut kept: Vec<Dash> = kept.into_values().collect();
+    kept.sort_unstable_by(|a, b| a.as_flattened().partial_cmp(b.as_flattened()).unwrap());
+    let mids: Vec<[f64; 2]> = kept
+        .iter()
+        .map(|[a, b]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0])
+        .collect();
+    cluster_points(&mids)
+        .into_iter()
+        .map(|members| members.into_iter().map(|i| kept[i]).collect())
+        .collect()
 }
 
 /// OCAD symbol number for a DXF layer in the cross reference table.
@@ -1052,7 +971,13 @@ fn published_knolls(features: &[Value]) -> Vec<([f64; 2], String)> {
         }
         candidates.push(([x, y], layer.to_string()));
     }
-    candidates.sort_by_key(|(_, l)| l.starts_with("ugly"));
+    // certain before uncertain, then by position: the order the detector wrote them in differs
+    // between two tiles that share a knoll, and a greedy filter must not depend on it
+    candidates.sort_by(|(p, l), (q, m)| {
+        (l.starts_with("ugly"), p[0], p[1])
+            .partial_cmp(&(m.starts_with("ugly"), q[0], q[1]))
+            .unwrap()
+    });
     let mut kept: Vec<([f64; 2], String)> = Vec::new();
     for (p, layer) in candidates {
         if kept.iter().all(|(k, _)| dist(*k, p) >= POINT_MIN_SPACING_M) {
@@ -1122,13 +1047,13 @@ fn line_feature(mut pieces: Vec<Vec<[f64; 2]>>, properties: Value) -> Option<Val
 /// rewriting the files in place:
 ///
 /// * `dotknolls`: the spacing filter of [`published_knolls`];
-/// * `contours` and `formlines`: each line generalised, broken around the knoll symbols
-///   and curve-sampled ([`published_pieces`]). With `formline=2` the half-interval
+/// * `contours` and `formlines`: each line generalised and broken around the knoll symbols
+///   ([`published_pieces`]). With `formline=2` the half-interval
 ///   `*_intermed` lines are only candidates -- the renderer's selection of them is
 ///   `formlines` -- so they are dropped from `contours`; in the other modes they are
 ///   drawn as full contours and published as 101;
-/// * `cliffs`: the renderer's per-cell dashes chained into cliff lines, sub-minimum faces
-///   dropped ([`chain_cliff_dashes`]).
+/// * `cliffs`: the renderer's dashes, repeats dropped, one MultiLineString per cliff face
+///   ([`cliff_faces`]).
 ///
 /// It runs on the padded tile, before `batch_process` crops it, so a decision near a tile
 /// edge is made from the same ground on both sides of it. The area outputs are left as
@@ -1183,10 +1108,7 @@ pub fn publish_tile(
             };
             let pieces = line_parts(&f["geometry"])
                 .iter()
-                .flat_map(|pts| {
-                    let closed = pts.len() > 2 && pts.first() == pts.last();
-                    published_pieces(&isom, pts, closed, &knolls)
-                })
+                .flat_map(|pts| published_pieces(&isom, pts, &knolls))
                 .collect();
             out.extend(line_feature(pieces, properties));
         }
@@ -1194,28 +1116,31 @@ pub fn publish_tile(
     }
 
     if let Some(features) = read_features(fs, &tmpfolder.join("cliffs.geojson"))? {
-        let (mut mids_202, mut mids_201) = (Vec::new(), Vec::new());
+        let (mut dashes_202, mut dashes_201) = (Vec::new(), Vec::new());
         for f in &features {
             for pts in line_parts(&f["geometry"]) {
                 let (Some(a), Some(b)) = (pts.first(), pts.last()) else {
                     continue;
                 };
-                let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
                 if f["properties"]["isom"] == "202" {
-                    mids_202.push(mid);
+                    dashes_202.push([*a, *b]);
                 } else {
-                    mids_201.push(mid);
+                    dashes_201.push([*a, *b]);
                 }
             }
         }
         let mut out = Vec::new();
-        for (mids, layer, isom) in [(&mids_202, "cliff2", "202"), (&mids_201, "cliff3", "201")] {
-            for chain in chain_cliff_dashes(mids) {
-                out.push(feature(
-                    "LineString",
-                    coords_line(curve_points(isom, &chain, false)),
-                    &[("layer", layer), ("isom", isom)],
-                ));
+        for (dashes, layer, isom) in [
+            (&dashes_202, "cliff2", "202"),
+            (&dashes_201, "cliff3", "201"),
+        ] {
+            for face in cliff_faces(dashes) {
+                let parts = face.into_iter().map(coords_line).collect();
+                out.push(json!({
+                    "type": "Feature",
+                    "properties": {"layer": layer, "isom": isom},
+                    "geometry": {"type": "MultiLineString", "coordinates": Value::Array(parts)},
+                }));
             }
         }
         write("cliffs", &out)?;
@@ -1480,46 +1405,58 @@ mod tests {
         assert_eq!(inner.len(), 5);
     }
 
+    /// A knoll ring narrower than the minimum mouth is still a knoll: the generalisation must
+    /// not splice across it and leave a line where the map has a hill.
     #[test]
-    fn curve_points_samples_bezier_for_geojson() {
-        // jagged open contour: sampled output is denser, endpoints unchanged
-        let pts: Vec<[f64; 2]> = (0..10)
-            .map(|i| [i as f64 * 10.0, if i % 2 == 0 { 0.0 } else { 8.0 }])
-            .collect();
-        let out = curve_points("101", &pts, false);
-        assert!(out.len() > pts.len(), "curve layer must be densified");
-        assert_eq!(out.first(), pts.first());
-        assert_eq!(out.last(), pts.last());
-        // non-curve layer passes through untouched
-        assert_eq!(curve_points("526", &pts, false), pts);
-        // closed ring stays closed
-        let ring = [
-            [0.0, 0.0],
-            [30.0, 0.0],
-            [30.0, 30.0],
-            [0.0, 30.0],
-            [0.0, 0.0],
-        ];
-        let out = curve_points("406", &ring, true);
-        assert_eq!(out.first(), out.last(), "ring must stay closed");
-    }
-
-    #[test]
-    fn cliff_chain_follows_curved_face() {
-        // dash midpoints along a semicircular face (r=30 m), ~2.4 m apart
-        let mids: Vec<[f64; 2]> = (0..40)
+    fn generalise_contour_keeps_a_small_knoll_round() {
+        // a 6 m wide ring, vertices ~1.2 m apart, closed
+        let mut ring: Vec<[f64; 2]> = (0..16)
             .map(|i| {
-                let t = i as f64 / 39.0 * std::f64::consts::PI;
-                [30.0 * t.cos(), 30.0 * t.sin()]
+                let t = f64::from(i) / 16.0 * std::f64::consts::TAU;
+                [3.0 * t.cos(), 3.0 * t.sin()]
             })
             .collect();
-        let chains = chain_cliff_dashes(&mids);
-        assert_eq!(chains.len(), 1, "one face, one chain");
-        assert_eq!(chains[0].len(), 40, "all dashes chained");
-        // correct ordering walks the arc: every step is one dash spacing, no jumps
-        for w in chains[0].windows(2) {
-            assert!(dist(w[0], w[1]) < 3.0, "chain jumps across the face");
-        }
+        ring.push(ring[0]);
+        assert_eq!(generalise_contour(&ring), ring);
+    }
+
+    /// The detector marks most of a rock face several times over. Repeats go, faces stay
+    /// apart, and none of it may depend on the order the dashes arrive in -- two tiles write
+    /// the same rock in different orders.
+    #[test]
+    fn cliff_faces_drop_repeats_and_keep_faces_apart() {
+        let face = |x0: f64| -> Vec<Dash> {
+            (0..10)
+                .map(|i| {
+                    let x = x0 + f64::from(i) * 2.0;
+                    [[x, 0.0], [x, 3.0]]
+                })
+                .collect()
+        };
+        let mut dashes = face(0.0);
+        // the same dashes again, written the other way round and a centimetre off
+        dashes.extend(
+            face(0.0)
+                .iter()
+                .map(|[a, b]| [[b[0] + 0.01, b[1]], [a[0] + 0.01, a[1]]]),
+        );
+        // a second face 50 m away
+        dashes.extend(face(50.0));
+
+        let faces = cliff_faces(&dashes);
+        assert_eq!(faces.len(), 2, "two faces");
+        assert!(
+            faces.iter().all(|f| f.len() == 10),
+            "repeats dropped: {faces:?}"
+        );
+
+        let mut reversed = dashes.clone();
+        reversed.reverse();
+        assert_eq!(
+            cliff_faces(&reversed),
+            faces,
+            "order of arrival changed the result"
+        );
     }
 
     #[test]
