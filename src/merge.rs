@@ -992,6 +992,29 @@ pub fn smoothjoin(
 mod tests {
     use super::Classification;
     use super::decorate_depression;
+
+    /// Every contour leaves smoothjoin with its downhill side on the right: that is what
+    /// makes the smoothing the same in two tiles that trace the line in opposite directions,
+    /// and what tells a consumer which way a slope line points.
+    #[test]
+    fn downhill_side_is_found() {
+        use super::downhill_on_left;
+        use crate::vec2d::Vec2D;
+        // ground rising to the north: height = 2 m per cell of y
+        let mut grid = Vec2D::new(10, 10, 0.0);
+        for x in 0..10 {
+            for y in 0..10 {
+                grid[(x, y)] = 2.0 * y as f64;
+            }
+        }
+        // a contour at 9 m, running east: downhill (south) is on its right
+        let x: Vec<f64> = (1..9).map(|i| i as f64).collect();
+        let y = vec![4.5; x.len()];
+        assert!(!downhill_on_left(&grid, 0.0, 0.0, 1.0, &x, &y, 9.0));
+        // the same contour running west has downhill on its left
+        let xr: Vec<f64> = x.iter().rev().copied().collect();
+        assert!(downhill_on_left(&grid, 0.0, 0.0, 1.0, &xr, &y, 9.0));
+    }
     use crate::geometry::{Point2, Ring};
     // A closed ring approximating a circle of the given ground radius, in metres.
     fn ring(radius: f64) -> (Vec<f64>, Vec<f64>) {
