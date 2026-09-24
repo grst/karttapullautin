@@ -7,6 +7,7 @@ use crate::geometry::Polylines;
 use crate::io::bytes::FromToBytes;
 use crate::io::fs::FileSystem;
 use crate::io::heightmap::HeightMap;
+use crate::mapframe::{DPI, GROUND_METRES_PER_INCH, WorldFile};
 use crate::vec2d::Vec2D;
 use image::ImageBuffer;
 use image::Rgba;
@@ -35,19 +36,9 @@ pub fn render(
 
     // Draw vegetation ----------
     let tfw_in = tmpfolder.join("vegetation.pgw");
-    let mut lines = fs.open(tfw_in).expect("PGW file does not exist").lines();
-    let x0 = lines
-        .nth(4)
-        .expect("no 4 line")
-        .expect("Could not read line 5")
-        .parse::<f64>()
-        .unwrap();
-    let y0 = lines
-        .next()
-        .expect("no 5 line")
-        .expect("Could not read line 6")
-        .parse::<f64>()
-        .unwrap();
+    let w = WorldFile::read(fs, tfw_in).expect("PGW file does not exist");
+    let x0 = w.x_origin;
+    let y0 = w.y_origin;
 
     let mut img_reader = image::ImageReader::new(
         fs.open(tmpfolder.join("vegetation.png"))
@@ -70,11 +61,11 @@ pub fn render(
 
     let eastoff = -((x0 - (-angle).tan() * y0)
         - ((x0 - (-angle).tan() * y0) / (250.0 / angle.cos())).floor() * (250.0 / angle.cos()))
-        / 254.0
-        * 600.0;
+        / GROUND_METRES_PER_INCH
+        * DPI;
 
-    let new_width = (w as f64 * 600.0 / 254.0 / scalefactor) as u32;
-    let new_height = (h as f64 * 600.0 / 254.0 / scalefactor) as u32;
+    let new_width = (w as f64 * DPI / GROUND_METRES_PER_INCH / scalefactor) as u32;
+    let new_height = (h as f64 * DPI / GROUND_METRES_PER_INCH / scalefactor) as u32;
     let mut img = image::imageops::resize(
         &img,
         new_width,
@@ -109,22 +100,27 @@ pub fn render(
 
     // north lines ----------------
     if angle != 999.0 {
-        let mut i: f64 = eastoff - 600.0 * 250.0 / 254.0 / angle.cos() * 100.0 / scalefactor;
-        while i < w as f64 * 5.0 * 600.0 / 254.0 / scalefactor {
+        let mut i: f64 =
+            eastoff - DPI * 250.0 / GROUND_METRES_PER_INCH / angle.cos() * 100.0 / scalefactor;
+        while i < w as f64 * 5.0 * DPI / GROUND_METRES_PER_INCH / scalefactor {
             for m in 0..nwidth {
                 draw_line_segment_mut(
                     &mut img,
                     (i as f32 + m as f32, 0.0),
                     (
                         (i as f32
-                            + (angle.tan() * (h as f64) * 600.0 / 254.0 / scalefactor) as f32)
+                            + (angle.tan() * (h as f64) * DPI
+                                / GROUND_METRES_PER_INCH
+                                / scalefactor) as f32)
                             + m as f32,
-                        (h as f32 * 600.0 / 254.0 / scalefactor as f32),
+                        (h as f32 * DPI as f32
+                            / GROUND_METRES_PER_INCH as f32
+                            / scalefactor as f32),
                     ),
                     Rgba([0, 0, 200, 255]),
                 );
             }
-            i += 600.0 * 250.0 / 254.0 / angle.cos() / scalefactor;
+            i += DPI * 250.0 / GROUND_METRES_PER_INCH / angle.cos() / scalefactor;
         }
     }
 
@@ -143,8 +139,8 @@ pub fn render(
         }
 
         // convert point to image coordinates
-        let x = (point.x - x0) * 600.0 / 254.0 / scalefactor;
-        let y = (y0 - point.y) * 600.0 / 254.0 / scalefactor;
+        let x = (point.x - x0) * DPI / GROUND_METRES_PER_INCH / scalefactor;
+        let y = (y0 - point.y) * DPI / GROUND_METRES_PER_INCH / scalefactor;
 
         let color = Rgba([166, 85, 43, 255]);
         draw_filled_circle_mut(&mut img, (x as i32, y as i32), 7, color)
@@ -250,13 +246,19 @@ pub fn render(
         .create(format!("{filename}.pgw"))
         .expect("Unable to create file");
 
+    // Copies vegetation.pgw as text, scaling only lines 0 and 3; the other lines keep their
+    // original bytes, so this cannot go through WorldFile::write yet (ticket 18).
     if let Ok(lines) = fs.open(file_in) {
         for (i, line) in lines.lines().enumerate() {
             let ip = line.unwrap_or(String::new());
             let x: f64 = ip.parse::<f64>().unwrap();
             if i == 0 || i == 3 {
-                write!(&mut pgw_file_out, "{}\r\n", x / 600.0 * 254.0 * scalefactor)
-                    .expect("Unable to write to file");
+                write!(
+                    &mut pgw_file_out,
+                    "{}\r\n",
+                    x / DPI * GROUND_METRES_PER_INCH * scalefactor
+                )
+                .expect("Unable to write to file");
             } else {
                 write!(&mut pgw_file_out, "{ip}\r\n").expect("Unable to write to file");
             }
@@ -299,8 +301,8 @@ fn draw_cliffs(
 
         // scale and flip all points into pixel-space
         for p in line.iter_mut() {
-            p.x = (p.x - x0) * 600.0 / 254.0 / scalefactor;
-            p.y = (y0 - p.y) * 600.0 / 254.0 / scalefactor;
+            p.x = (p.x - x0) * DPI / GROUND_METRES_PER_INCH / scalefactor;
+            p.y = (y0 - p.y) * DPI / GROUND_METRES_PER_INCH / scalefactor;
         }
 
         if line.first() != line.last() {
@@ -364,7 +366,7 @@ fn closed_ring_below_isom_minimum(x: &[f64], y: &[f64], scalefactor: f64) -> boo
         ymin = ymin.min(py);
         ymax = ymax.max(py);
     }
-    let to_metres = 254.0 / 600.0 * scalefactor;
+    let to_metres = GROUND_METRES_PER_INCH / DPI * scalefactor;
     (xmax - xmin).max(ymax - ymin) * to_metres < MIN_GROUND_M
 }
 
@@ -531,8 +533,8 @@ pub fn draw_curves(
             if *layer == Classification::SlopeLine {
                 line.first().map(|point| {
                     (
-                        (point.x - x0) * 600.0 / 254.0 / scalefactor,
-                        (y0 - point.y) * 600.0 / 254.0 / scalefactor,
+                        (point.x - x0) * DPI / GROUND_METRES_PER_INCH / scalefactor,
+                        (y0 - point.y) * DPI / GROUND_METRES_PER_INCH / scalefactor,
                     )
                 })
             } else {
@@ -550,8 +552,8 @@ pub fn draw_curves(
 
         // flip and scale the line points
         for p in line.iter_mut() {
-            p.x = (p.x - x0) * 600.0 / 254.0 / scalefactor;
-            p.y = (y0 - p.y) * 600.0 / 254.0 / scalefactor;
+            p.x = (p.x - x0) * DPI / GROUND_METRES_PER_INCH / scalefactor;
+            p.y = (y0 - p.y) * DPI / GROUND_METRES_PER_INCH / scalefactor;
         }
 
         // TEMP: split x and y values
@@ -597,10 +599,12 @@ pub fn draw_curves(
                     help[i] = false;
                     help2[i] = true;
                     help3[i] = false;
-                    let xx = (((x[i] / 600.0 * 254.0 * scalefactor + x0) - xstart) / size).floor()
-                        as usize;
-                    let yy = (((-y[i] / 600.0 * 254.0 * scalefactor + y0) - ystart) / size).floor()
-                        as usize;
+                    let xx = (((x[i] / DPI * GROUND_METRES_PER_INCH * scalefactor + x0) - xstart)
+                        / size)
+                        .floor() as usize;
+                    let yy = (((-y[i] / DPI * GROUND_METRES_PER_INCH * scalefactor + y0) - ystart)
+                        / size)
+                        .floor() as usize;
 
                     // make sure indices are within bounds for the grid lookups
                     if xx >= xyz.width() - 1 || yy >= xyz.height() - 1 || xx < 1 || yy < 1 {
@@ -813,8 +817,9 @@ pub fn draw_curves(
                 if curvew != 1.5 || formline == 0.0 || help2[i] || smallringtest {
                     if should_generate_formlines && curvew == 1.5 {
                         formiline_points.push(Point2::new(
-                            x[i] / 600.0 * 254.0 * scalefactor + x0,
-                            -y[i] / 600.0 * scalefactor * 254.0 + y0,
+                            x[i] / DPI * GROUND_METRES_PER_INCH * scalefactor + x0,
+                            // Operand order differs from the line above on purpose: changing it changes rounding (ticket 18).
+                            -y[i] / DPI * scalefactor * GROUND_METRES_PER_INCH + y0,
                         ));
                     }
 
@@ -966,7 +971,7 @@ mod tests {
     use super::closed_ring_below_isom_minimum;
 
     /// Render pixels per ground metre at 600 dpi, 1:10,000 (the transform in draw_curves).
-    const PX_PER_M: f64 = 600.0 / 254.0;
+    use crate::mapframe::PX_PER_METRE as PX_PER_M;
 
     /// A square ring of the given ground size, as the renderer would see it.
     fn ring(metres: f64) -> (Vec<f64>, Vec<f64>) {

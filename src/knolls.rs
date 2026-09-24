@@ -2,11 +2,14 @@ use image::{GrayImage, Luma};
 use imageproc::drawing::draw_line_segment_mut;
 use log::info;
 use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet;
 use std::error::Error;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::geometry::{BinaryDxf, Bounds, Classification, Geometry, Point2, Points, Polylines};
+use crate::geometry::{
+    BinaryDxf, Bounds, Classification, Geometry, Point2, Points, Polylines, Ring, join_polylines,
+};
 use crate::io::bytes::FromToBytes;
 use crate::io::fs::FileSystem;
 use crate::io::heightmap::HeightMap;
@@ -159,12 +162,6 @@ pub fn knolldetector(
     let xmax = (hmap.grid.width() - 1) as u64;
     let ymax = (hmap.grid.height() - 1) as u64;
 
-    // Temporary hashmap to store the xyz values (TODO: replace with direct hmap lookup!)
-    let mut xyz: HashMap<(u64, u64), f64> = HashMap::default();
-    for (x, y, h) in hmap.grid.iter() {
-        xyz.insert((x as u64, y as u64), h);
-    }
-
     let data = BinaryDxf::from_reader(&mut fs.open(tmpfolder.join("contours03.dxf.bin"))?)?;
     let Geometry::Polylines2(lines) = data.take_geometry().swap_remove(0) else {
         anyhow::bail!("contours03.dxf.bin should contain polylines");
@@ -173,149 +170,17 @@ pub fn knolldetector(
     let detected_bounds = Bounds::new(xmin as f64, xmax as f64, ymin as f64, ymax as f64);
     let mut detected_lines = Polylines::<Point2, Classification>::new();
 
-    // Internal type used to index into the hashmaps and vectors.
-    // Since using f64 coordinates directly has problems with rounding (and do not impl Eq and
-    // Hash), we can use an integer representation of the coordinates to index into the HashMaps.
-    // By multiplying by 1000, we can keep a precision of 3 decimal places, which is sufficient for
-    // what we need.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    struct Key {
-        x: i64,
-        y: i64,
-    }
-    impl Key {
-        fn new(x: f64, y: f64) -> Self {
-            Key {
-                x: (x * 1000.0) as i64,
-                y: (y * 1000.0) as i64,
-            }
-        }
-        /// Just a unique key for the case where we don't have a valid point.
-        fn none() -> Self {
-            Self {
-                x: i64::MAX,
-                y: i64::MAX,
-            }
-        }
-    }
-
-    let mut heads1: HashMap<Key, usize> = HashMap::default();
-    let mut heads2: HashMap<Key, usize> = HashMap::default();
-    let mut heads = Vec::<Key>::with_capacity(lines.len());
-    let mut tails = Vec::<Key>::with_capacity(lines.len());
-    let mut el_x = Vec::<Vec<f64>>::with_capacity(lines.len());
-    let mut el_y = Vec::<Vec<f64>>::with_capacity(lines.len());
-
-    for (j, (line, _c)) in lines.iter().enumerate() {
-        // TODO; might need to lower to 200
-        if line.len() < 201 {
-            let first = line.first().unwrap();
-            let last = line.last().unwrap();
-
-            let head = Key::new(first.x, first.y);
-            let tail = Key::new(last.x, last.y);
-
-            heads.push(head);
-            tails.push(tail);
-
-            // TODO: this is not very efficient (collecting all x and y separately into Vecs), but it means the logic further down can stay the same
-            el_x.push(line.iter().map(|p| p.x).collect::<Vec<_>>());
-            el_y.push(line.iter().map(|p| p.y).collect::<Vec<_>>());
-
-            if *heads1.get(&head).unwrap_or(&0) == 0 {
-                heads1.insert(head, j);
-            } else {
-                heads2.insert(head, j);
-            }
-            if *heads1.get(&tail).unwrap_or(&0) == 0 {
-                heads1.insert(tail, j);
-            } else {
-                heads2.insert(tail, j);
-            }
-        } else {
-            heads.push(Key::none());
-            tails.push(Key::none());
-            el_x.push(vec![]);
-            el_y.push(vec![]);
-        }
-    }
-
-    for l in 0..lines.len() {
-        let mut to_join = 0;
-        if !el_x[l].is_empty() {
-            let mut end_loop = false;
-            while !end_loop {
-                let tmp = *heads1.get(&heads[l]).unwrap_or(&0);
-                if tmp != 0 && tmp != l && !el_x[tmp].is_empty() {
-                    to_join = tmp;
-                } else {
-                    let tmp = *heads2.get(&heads[l]).unwrap_or(&0);
-                    if tmp != 0 && tmp != l && !el_x[tmp].is_empty() {
-                        to_join = tmp;
-                    } else {
-                        let tmp = *heads2.get(&tails[l]).unwrap_or(&0);
-                        if tmp != 0 && tmp != l && !el_x[tmp].is_empty() {
-                            to_join = tmp;
-                        } else {
-                            let tmp = *heads1.get(&tails[l]).unwrap_or(&0);
-                            if tmp != 0 && tmp != l && !el_x[tmp].is_empty() {
-                                to_join = tmp;
-                            } else {
-                                end_loop = true;
-                            }
-                        }
-                    }
-                }
-                if !end_loop {
-                    if tails[l] == heads[to_join] {
-                        heads2.insert(tails[l], 0);
-                        heads1.insert(tails[l], 0);
-                        let mut to_append = el_x[to_join].to_vec();
-                        el_x[l].append(&mut to_append);
-                        let mut to_append = el_y[to_join].to_vec();
-                        el_y[l].append(&mut to_append);
-                        tails[l] = tails[to_join];
-                        el_x[to_join].clear();
-                        el_y[to_join].clear();
-                    } else if tails[l] == tails[to_join] {
-                        heads2.insert(tails[l], 0);
-                        heads1.insert(tails[l], 0);
-                        let mut to_append = el_x[to_join].to_vec();
-                        to_append.reverse();
-                        el_x[l].append(&mut to_append);
-                        let mut to_append = el_y[to_join].to_vec();
-                        to_append.reverse();
-                        el_y[l].append(&mut to_append);
-                        tails[l] = heads[to_join];
-                        el_x[to_join].clear();
-                        el_y[to_join].clear();
-                    } else if heads[l] == tails[to_join] {
-                        heads2.insert(heads[l], 0);
-                        heads1.insert(heads[l], 0);
-                        let to_append = el_x[to_join].to_vec();
-                        el_x[l].splice(0..0, to_append);
-                        let to_append = el_y[to_join].to_vec();
-                        el_y[l].splice(0..0, to_append);
-                        heads[l] = heads[to_join];
-                        el_x[to_join].clear();
-                        el_y[to_join].clear();
-                    } else if heads[l] == heads[to_join] {
-                        heads2.insert(heads[l], 0);
-                        heads1.insert(heads[l], 0);
-                        let mut to_append = el_x[to_join].to_vec();
-                        to_append.reverse();
-                        el_x[l].splice(0..0, to_append);
-                        let mut to_append = el_y[to_join].to_vec();
-                        to_append.reverse();
-                        el_y[l].splice(0..0, to_append);
-                        heads[l] = tails[to_join];
-                        el_x[to_join].clear();
-                        el_y[to_join].clear();
-                    }
-                }
-            }
-        }
-    }
+    // TODO; might need to lower to 200
+    let joined = join_polylines(&lines, 201);
+    // TODO: this is not very efficient (collecting all x and y separately into Vecs), but it means the logic further down can stay the same
+    let mut el_x: Vec<Vec<f64>> = joined
+        .iter()
+        .map(|l| l.iter().map(|p| p.x).collect())
+        .collect();
+    let mut el_y: Vec<Vec<f64>> = joined
+        .iter()
+        .map(|l| l.iter().map(|p| p.y).collect())
+        .collect();
 
     let mut elevation: HashMap<u64, f64> = HashMap::default();
     for l in 0..lines.len() {
@@ -370,22 +235,30 @@ pub fn knolldetector(
                     let xo = (xm - xstart) / size;
                     let yo = (ym - ystart) / size;
                     if xo == xo.floor() {
-                        let h1 = *xyz
-                            .get(&(xo.floor() as u64, yo.floor() as u64))
-                            .unwrap_or(&0.0);
-                        let h2 = *xyz
-                            .get(&(xo.floor() as u64, yo.floor() as u64 + 1))
-                            .unwrap_or(&0.0);
+                        let h1 = hmap
+                            .grid
+                            .get((xo.floor() as usize, yo.floor() as usize))
+                            .copied()
+                            .unwrap_or(0.0);
+                        let h2 = hmap
+                            .grid
+                            .get((xo.floor() as usize, yo.floor() as usize + 1))
+                            .copied()
+                            .unwrap_or(0.0);
                         h = h1 * (yo.floor() + 1.0 - yo) + h2 * (yo - yo.floor());
                         h = (h / interval + 0.5).floor() * interval;
                         break;
                     } else if m < (el_x_len - 3) && yo == yo.floor() {
-                        let h1 = *xyz
-                            .get(&(xo.floor() as u64, yo.floor() as u64))
-                            .unwrap_or(&0.0);
-                        let h2 = *xyz
-                            .get(&(xo.floor() as u64 + 1, yo.floor() as u64))
-                            .unwrap_or(&0.0);
+                        let h1 = hmap
+                            .grid
+                            .get((xo.floor() as usize, yo.floor() as usize))
+                            .copied()
+                            .unwrap_or(0.0);
+                        let h2 = hmap
+                            .grid
+                            .get((xo.floor() as usize + 1, yo.floor() as usize))
+                            .copied()
+                            .unwrap_or(0.0);
                         h = h1 * (xo.floor() + 1.0 - xo) + h2 * (xo - xo.floor());
                         h = (h / interval + 0.5).floor() * interval;
                     }
@@ -412,12 +285,15 @@ pub fn knolldetector(
                     }
                     m += 1;
                 }
-                let h_center = *xyz
-                    .get(&(
-                        ((xa - xstart) / size).floor() as u64,
-                        ((ya - ystart) / size).floor() as u64,
+                let h_center = hmap
+                    .grid
+                    .get((
+                        ((xa - xstart) / size).floor() as usize,
+                        ((ya - ystart) / size).floor() as usize,
                     ))
-                    .unwrap_or(&0.0);
+                    .copied()
+                    .unwrap_or(0.0);
+                // Legacy ray cast kept inline: it skips the closing edge (n < len - 1), so Ring::contains would not be output-identical. See ticket 18.
                 let mut hit = 0;
                 let xtest = ((xa - xstart) / size).floor() * size + xstart + 0.000000001;
                 let ytest = ((ya - ystart) / size).floor() * size + ystart + 0.000000001;
@@ -495,6 +371,7 @@ pub fn knolldetector(
             let mut y = el_y[l].to_vec();
             let taily = *el_y[l].first().unwrap();
             y.push(taily);
+            let ring = Ring::from_xy(&x, &y);
 
             let mut minx = f64::MAX;
             let mut miny = f64::MAX;
@@ -535,28 +412,9 @@ pub fn knolldetector(
                     && xtest > minx
                     && ytest < maxy
                     && ytest > miny
+                    && ring.contains(Point2::new(xtest, ytest))
                 {
-                    let mut hit = 0;
-                    let mut n = 0;
-                    let mut x0 = 0.0;
-                    let mut y0 = 0.0;
-                    while n < x.len() {
-                        let x1 = x[n];
-                        let y1 = y[n];
-
-                        if n > 0
-                            && ((y0 <= ytest && ytest < y1) || (y1 <= ytest && ytest < y0))
-                            && (xtest < ((x1 - x0) * (ytest - y0) / (y1 - y0) + x0))
-                        {
-                            hit += 1;
-                        }
-                        x0 = x1;
-                        y0 = y1;
-                        n += 1;
-                    }
-                    if hit % 2 == 1 {
-                        skip = true;
-                    }
+                    skip = true;
                 }
             }
             if !skip {
@@ -586,6 +444,7 @@ pub fn knolldetector(
             let mut y = el_y[l].to_vec();
             let taily = *el_y[l].first().unwrap();
             y.push(taily);
+            let ring = Ring::from_xy(&x, &y);
 
             let &BoundingBox {
                 minx,
@@ -606,31 +465,10 @@ pub fn knolldetector(
                     && xtest > minx
                     && ytest < maxy
                     && ytest > miny
+                    && ring.contains(Point2::new(xtest, ytest))
                 {
-                    let mut hit = 0;
-                    let mut n = 0;
-
-                    let mut x0 = 0.0;
-                    let mut y0 = 0.0;
-                    while n < x.len() {
-                        let x1 = x[n];
-                        let y1 = y[n];
-
-                        if n > 0
-                            && ((y0 <= ytest && ytest < y1) || (y1 <= ytest && ytest < y0))
-                            && (xtest < ((x1 - x0) * (ytest - y0) / (y1 - y0) + x0))
-                        {
-                            hit += 1;
-                        }
-                        x0 = x1;
-                        y0 = y1;
-
-                        n += 1;
-                    }
-                    if hit % 2 == 1 {
-                        skip = false;
-                        topid = id;
-                    }
+                    skip = false;
+                    topid = id;
                 }
             }
             if !skip {
@@ -721,6 +559,7 @@ pub fn knolldetector(
             let mut y = el_y[l].to_vec();
             let taily = *el_y[l].first().unwrap();
             y.push(taily);
+            let ring = Ring::from_xy(&x, &y);
 
             let &BoundingBox {
                 minx,
@@ -738,31 +577,15 @@ pub fn knolldetector(
                 } = head;
 
                 ltopid = topid;
-                if id != ll && !skip && xtest < maxx && xtest > minx && ytest < maxy && ytest > miny
+                if id != ll
+                    && !skip
+                    && xtest < maxx
+                    && xtest > minx
+                    && ytest < maxy
+                    && ytest > miny
+                    && ring.contains(Point2::new(xtest, ytest))
                 {
-                    let mut hit = 0;
-                    let mut n = 0;
-
-                    let mut x0 = 0.0;
-                    let mut y0 = 0.0;
-                    while n < x.len() {
-                        let x1 = x[n];
-                        let y1 = y[n];
-
-                        if n > 0
-                            && ((y0 <= ytest && ytest < y1) || (y1 <= ytest && ytest < y0))
-                            && (xtest < ((x1 - x0) * (ytest - y0) / (y1 - y0) + x0))
-                        {
-                            hit += 1;
-                        }
-                        x0 = x1;
-                        y0 = y1;
-
-                        n += 1;
-                    }
-                    if hit % 2 == 1 {
-                        skip = true;
-                    }
+                    skip = true;
                 }
             }
 
@@ -944,7 +767,7 @@ pub fn xyzknolls(
                 y[k] = yy + (y[k] - yy) * 0.8;
             }
         }
-        let mut touched: HashMap<String, bool> = HashMap::default();
+        let mut touched: FxHashSet<(usize, usize)> = Default::default();
         let mut minx = u64::MAX;
         let mut miny = u64::MAX;
         let mut maxx = u64::MIN;
@@ -974,6 +797,7 @@ pub fn xyzknolls(
         let mut x0 = 0.0;
         let mut y0 = 0.0;
 
+        // Legacy ray cast kept inline: `n > 1` skips the first edge v0->v1, so Ring::contains would not be output-identical. See ticket 18.
         for ii in minx as usize..(maxx as usize + 1) {
             for jj in miny as usize..(maxy as usize + 1) {
                 let mut hit = 0;
@@ -994,8 +818,7 @@ pub fn xyzknolls(
                 if hit % 2 == 1 {
                     let tmp = xyz2.grid[(ii, jj)] + move1;
                     xyz2.grid[(ii, jj)] = tmp;
-                    let coords = format!("{ii}_{jj}");
-                    touched.insert(coords, true);
+                    touched.insert((ii, jj));
                 }
             }
         }
@@ -1007,8 +830,13 @@ pub fn xyzknolls(
                 let ii: f64 = xx - range + iii as f64;
                 let jj: f64 = yy - range + jjj as f64;
                 if ii > 0.0 && ii < xmax as f64 && jj > 0.0 && jj < ymax as f64 {
-                    let coords = format!("{ii}_{jj}");
-                    if !*touched.get(&coords).unwrap_or(&false) {
+                    // The legacy lookup compared `format!("{ii}_{jj}")` strings, which only match
+                    // the integer keys inserted above when ii and jj are whole numbers (range is
+                    // fractional whenever dist * 0.8 - 1.0 is not clamped). Kept so output is identical.
+                    if !(ii.fract() == 0.0
+                        && jj.fract() == 0.0
+                        && touched.contains(&(ii as usize, jj as usize)))
+                    {
                         xyz2.grid[(ii as usize, jj as usize)] +=
                             (range - (xx - ii).abs()) / range * (range - (yy - jj).abs()) / range
                                 * move2;

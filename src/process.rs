@@ -8,8 +8,6 @@ use rand::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use std::collections::hash_map::Entry;
 use std::error::Error;
-use std::io::BufRead;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -24,6 +22,7 @@ use crate::io::heightmap::HeightMap;
 use crate::io::xyz::XyzInternalWriter;
 use crate::io::xyz::XyzRecord;
 use crate::knolls;
+use crate::mapframe::{DPI, GROUND_METRES_PER_INCH, WorldFile};
 use crate::merge;
 use crate::plan::InputFileIndex;
 use crate::plan::Operation;
@@ -705,60 +704,18 @@ pub fn batch_process(
         // crop
         let tfw_in = PathBuf::from(format!("pullautus{thread}.pgw"));
         if fs.exists(&tfw_in) {
-            let mut lines = fs.open(&tfw_in).expect("PGW file does not exist").lines();
-            let tfw0 = lines
-                .next()
-                .expect("no 1 line")
-                .expect("Could not read line 1")
-                .parse::<f64>()
-                .unwrap();
-            let tfw1 = lines
-                .next()
-                .expect("no 2 line")
-                .expect("Could not read line 2")
-                .parse::<f64>()
-                .unwrap();
-            let tfw2 = lines
-                .next()
-                .expect("no 3 line")
-                .expect("Could not read line 3")
-                .parse::<f64>()
-                .unwrap();
-            let tfw3 = lines
-                .next()
-                .expect("no 4 line")
-                .expect("Could not read line 4")
-                .parse::<f64>()
-                .unwrap();
-            let tfw4 = lines
-                .next()
-                .expect("no 5 line")
-                .expect("Could not read line 5")
-                .parse::<f64>()
-                .unwrap();
-            let tfw5 = lines
-                .next()
-                .expect("no 6 line")
-                .expect("Could not read line 6")
-                .parse::<f64>()
-                .unwrap();
+            let tfw = WorldFile::read(fs, &tfw_in).expect("PGW file does not exist");
 
-            drop(lines);
-
-            let dx = minx - tfw4;
-            let dy = -maxy + tfw5;
+            let dx = minx - tfw.x_origin;
+            let dy = -maxy + tfw.y_origin;
 
             let mut pgw_file_out = fs.create(&tfw_in).expect("Unable to create file");
-            write!(
-                &mut pgw_file_out,
-                "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
-                tfw0,
-                tfw1,
-                tfw2,
-                tfw3,
-                minx + tfw0 / 2.0,
-                maxy - tfw0 / 2.0
-            )
+            WorldFile {
+                x_origin: minx + tfw.pixel_size_x / 2.0,
+                y_origin: maxy - tfw.pixel_size_x / 2.0,
+                ..tfw
+            }
+            .write(&mut pgw_file_out)
             .expect("Unable to write to file");
 
             drop(pgw_file_out);
@@ -772,15 +729,15 @@ pub fn batch_process(
                 .read_image_png(format!("pullautus{thread}.png"))
                 .expect("Opening image failed");
             let mut img = RgbImage::from_pixel(
-                ((maxx - minx) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
-                ((maxy - miny) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
+                ((maxx - minx) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
+                ((maxy - miny) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
                 Rgb([255, 255, 255]),
             );
             image::imageops::overlay(
                 &mut img,
                 &orig_img.to_rgb8(),
-                (-dx * 600.0 / 254.0 / scalefactor) as i64,
-                (-dy * 600.0 / 254.0 / scalefactor) as i64,
+                (-dx * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
+                (-dy * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
             );
 
             img.write_to(
@@ -795,15 +752,15 @@ pub fn batch_process(
                 .read_image_png(format!("pullautus_depr{thread}.png"))
                 .expect("Opening image failed");
             let mut img = RgbImage::from_pixel(
-                ((maxx - minx) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
-                ((maxy - miny) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
+                ((maxx - minx) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
+                ((maxy - miny) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
                 Rgb([255, 255, 255]),
             );
             image::imageops::overlay(
                 &mut img,
                 &orig_img.to_rgb8(),
-                (-dx * 600.0 / 254.0 / scalefactor) as i64,
-                (-dy * 600.0 / 254.0 / scalefactor) as i64,
+                (-dx * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
+                (-dy * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
             );
 
             img.write_to(
@@ -837,62 +794,22 @@ pub fn batch_process(
             if !contoursonly && !cliffsonly {
                 let path = format!("temp{thread}/undergrowth.pgw");
                 let tfw_in = Path::new(&path);
-                let mut lines = fs.open(tfw_in).expect("PGW file does not exist").lines();
-                let tfw0 = lines
-                    .next()
-                    .expect("no 1 line")
-                    .expect("Could not read line 1")
-                    .parse::<f64>()
-                    .unwrap();
-                let tfw1 = lines
-                    .next()
-                    .expect("no 2 line")
-                    .expect("Could not read line 2")
-                    .parse::<f64>()
-                    .unwrap();
-                let tfw2 = lines
-                    .next()
-                    .expect("no 3 line")
-                    .expect("Could not read line 3")
-                    .parse::<f64>()
-                    .unwrap();
-                let tfw3 = lines
-                    .next()
-                    .expect("no 4 line")
-                    .expect("Could not read line 4")
-                    .parse::<f64>()
-                    .unwrap();
-                let tfw4 = lines
-                    .next()
-                    .expect("no 5 line")
-                    .expect("Could not read line 5")
-                    .parse::<f64>()
-                    .unwrap();
-                let tfw5 = lines
-                    .next()
-                    .expect("no 6 line")
-                    .expect("Could not read line 6")
-                    .parse::<f64>()
-                    .unwrap();
+                let tfw = WorldFile::read(fs, tfw_in).expect("PGW file does not exist");
 
-                let dx = minx - tfw4;
-                let dy = -maxy + tfw5;
+                let dx = minx - tfw.x_origin;
+                let dy = -maxy + tfw.y_origin;
 
                 let mut pgw_file_out = fs
                     .create(PathBuf::from(&format!(
                         "{batchoutfolder}/{laz}_undergrowth.pgw"
                     )))
                     .expect("Unable to create file");
-                write!(
-                    &mut pgw_file_out,
-                    "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
-                    tfw0,
-                    tfw1,
-                    tfw2,
-                    tfw3,
-                    minx + tfw0 / 2.0,
-                    maxy - tfw0 / 2.0
-                )
+                WorldFile {
+                    x_origin: minx + tfw.pixel_size_x / 2.0,
+                    y_origin: maxy - tfw.pixel_size_x / 2.0,
+                    ..tfw
+                }
+                .write(&mut pgw_file_out)
                 .expect("Unable to write to file");
                 drop(pgw_file_out);
 
@@ -904,15 +821,15 @@ pub fn batch_process(
                 orig_img_reader.no_limits();
                 let orig_img = orig_img_reader.decode().unwrap();
                 let mut img = RgbaImage::from_pixel(
-                    ((maxx - minx) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
-                    ((maxy - miny) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
+                    ((maxx - minx) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
+                    ((maxy - miny) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
                     Rgba([255, 255, 255, 0]),
                 );
                 image::imageops::overlay(
                     &mut img,
                     &orig_img,
-                    (-dx * 600.0 / 254.0 / scalefactor) as i64,
-                    (-dy * 600.0 / 254.0 / scalefactor) as i64,
+                    (-dx * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
+                    (-dy * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
                 );
 
                 img.write_to(
@@ -948,13 +865,8 @@ pub fn batch_process(
                 let mut pgw_file_out = fs
                     .create(format!("{batchoutfolder}/{laz}_vege.pgw"))
                     .expect("Unable to create file");
-                write!(
-                    &mut pgw_file_out,
-                    "1.0\r\n0.0\r\n0.0\r\n-1.0\r\n{}\r\n{}\r\n",
-                    minx + 0.5,
-                    maxy - 0.5
-                )
-                .expect("Unable to write to file");
+                WorldFile::write_unit_resolution(&mut pgw_file_out, minx + 0.5, maxy - 0.5)
+                    .expect("Unable to write to file");
 
                 drop(pgw_file_out);
 

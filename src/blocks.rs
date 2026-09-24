@@ -3,7 +3,6 @@ use imageproc::drawing::draw_filled_rect_mut;
 use imageproc::filter::median_filter;
 use imageproc::rect::Rect;
 use log::info;
-use rustc_hash::FxHashMap as HashMap;
 use std::{error::Error, path::Path};
 
 use crate::io::{bytes::FromToBytes, fs::FileSystem, heightmap::HeightMap, xyz::XyzInternalReader};
@@ -21,12 +20,6 @@ pub fn blocks(fs: &impl FileSystem, tmpfolder: &Path) -> Result<(), Box<dyn Erro
     let xmax = hmap.grid.width() - 1;
     let ymax = hmap.grid.height() - 1;
 
-    // Temporarily convert to HashMap for not having to go through all the logic below.
-    let mut xyz: HashMap<(u64, u64), f64> = HashMap::default();
-    for (x, y, h) in hmap.grid.iter() {
-        xyz.insert((x as u64, y as u64), h);
-    }
-
     let mut img = RgbImage::from_pixel(xmax as u32 * 2, ymax as u32 * 2, Rgb([255, 255, 255]));
     let mut img2 = RgbaImage::from_pixel(xmax as u32 * 2, ymax as u32 * 2, Rgba([0, 0, 0, 0]));
 
@@ -42,13 +35,13 @@ pub fn blocks(fs: &impl FileSystem, tmpfolder: &Path) -> Result<(), Box<dyn Erro
             let r4 = r.number_of_returns;
             let r5 = r.return_number;
 
-            let xx = ((x - xstartxyz) / size).floor() as u64;
-            let yy = ((y - ystartxyz) / size).floor() as u64;
+            let xx = ((x - xstartxyz) / size).floor() as usize;
+            let yy = ((y - ystartxyz) / size).floor() as usize;
             if r3 != 2
                 && r3 != 9
                 && r4 == 1
                 && r5 == 1
-                && h - *xyz.get(&(xx, yy)).unwrap_or(&0.0) > 2.0
+                && h - hmap.grid.get((xx, yy)).copied().unwrap_or(0.0) > 2.0
             {
                 draw_filled_rect_mut(
                     &mut img,

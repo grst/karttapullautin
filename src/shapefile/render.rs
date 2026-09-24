@@ -10,6 +10,7 @@ use log::{debug, info};
 use crate::{
     config::Config,
     io::fs::FileSystem,
+    mapframe::{DPI, GROUND_METRES_PER_INCH, PX_PER_METRE, WorldFile},
     shapefile::{
         canvas::{Canvas, Color},
         mapping::{Mapping, Operator},
@@ -76,12 +77,9 @@ pub fn render(
         return Ok(());
     }
 
-    let data = fs.read_to_string(input).expect("Can not read input file");
-    let d: Vec<&str> = data.split('\n').collect();
-
-    let x0 = d[4].trim().parse::<f64>().unwrap();
-    let y0 = d[5].trim().parse::<f64>().unwrap();
-    // let resvege = d[0].trim().parse::<f64>().unwrap();
+    let w = WorldFile::read(fs, input).expect("Can not read input file");
+    let x0 = w.x_origin;
+    let y0 = w.y_origin;
 
     let mut img_reader = image::ImageReader::new(
         fs.open(tmpfolder.join("vegetation.png"))
@@ -93,8 +91,8 @@ pub fn render(
     let w = img.width() as f64;
     let h = img.height() as f64;
 
-    let outw = w * 600.0 / 254.0 / scalefactor;
-    let outh = h * 600.0 / 254.0 / scalefactor;
+    let outw = w * DPI / GROUND_METRES_PER_INCH / scalefactor;
+    let outh = h * DPI / GROUND_METRES_PER_INCH / scalefactor;
 
     // TODO: only allocate the canvas that are actually used... in a lazy way
     let (width, height) = (outw as u32, outh as u32);
@@ -156,10 +154,10 @@ pub fn render(
         // drawshape comes here
         let mut reader = fs.read_shapefile(file.clone())?;
         let bbox = reader.header().bbox;
-        let minx = (600.0 / 254.0 / scalefactor * (bbox.min.x - x0)).floor();
-        let maxy = (600.0 / 254.0 / scalefactor * (y0 - bbox.min.y)).floor();
-        let maxx = (600.0 / 254.0 / scalefactor * (bbox.max.x - x0)).floor();
-        let miny = (600.0 / 254.0 / scalefactor * (y0 - bbox.max.y)).floor();
+        let minx = (PX_PER_METRE / scalefactor * (bbox.min.x - x0)).floor();
+        let maxy = (PX_PER_METRE / scalefactor * (y0 - bbox.min.y)).floor();
+        let maxx = (PX_PER_METRE / scalefactor * (bbox.max.x - x0)).floor();
+        let miny = (PX_PER_METRE / scalefactor * (y0 - bbox.max.y)).floor();
         log::debug!("Bounding box: {bbox:?}");
         if minx > outw || maxx < 0.0 || miny > outh || maxy < 0.0 {
             info!("Skipping shapefile {}, out of bounds.", file.display());
@@ -178,10 +176,10 @@ pub fn render(
                 _ => continue, // we don't care about other types
             };
 
-            let minx = (600.0 / 254.0 / scalefactor * (bbox.min.x - x0)).floor();
-            let maxy = (600.0 / 254.0 / scalefactor * (y0 - bbox.min.y)).floor();
-            let maxx = (600.0 / 254.0 / scalefactor * (bbox.max.x - x0)).floor();
-            let miny = (600.0 / 254.0 / scalefactor * (y0 - bbox.max.y)).floor();
+            let minx = (PX_PER_METRE / scalefactor * (bbox.min.x - x0)).floor();
+            let maxy = (PX_PER_METRE / scalefactor * (y0 - bbox.min.y)).floor();
+            let maxx = (PX_PER_METRE / scalefactor * (bbox.max.x - x0)).floor();
+            let miny = (PX_PER_METRE / scalefactor * (y0 - bbox.max.y)).floor();
             if minx > outw || maxx < 0.0 || miny > outh || maxy < 0.0 {
                 continue;
             }
@@ -613,8 +611,8 @@ pub fn render(
                             let x = point.x;
                             let y = point.y;
                             poly.push((
-                                (600.0 / 254.0 / scalefactor * (x - x0)).floor() as f32,
-                                (600.0 / 254.0 / scalefactor * (y0 - y)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (x - x0)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (y0 - y)).floor() as f32,
                             ));
                         }
                     }
@@ -710,12 +708,12 @@ pub fn render(
                             let x = point.x;
                             let y = point.y;
                             poly.push((
-                                (600.0 / 254.0 / scalefactor * (x - x0)).floor() as f32,
-                                (600.0 / 254.0 / scalefactor * (y0 - y)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (x - x0)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (y0 - y)).floor() as f32,
                             ));
                             polyborder.push((
-                                (600.0 / 254.0 / scalefactor * (x - x0)).floor() as f32,
-                                (600.0 / 254.0 / scalefactor * (y0 - y)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (x - x0)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (y0 - y)).floor() as f32,
                             ));
                         }
                         polys.push(poly);
@@ -769,9 +767,9 @@ pub fn render(
 
     let mut i = 0.0_f32;
     imgmarsh.set_transparent_color();
-    while i < ((h * 600.0 / 254.0 / scalefactor + 500.0) as f32) {
+    while i < ((h * DPI / GROUND_METRES_PER_INCH / scalefactor + 500.0) as f32) {
         i += 14.0;
-        let wd = (w * 600.0 / 254.0 / scalefactor + 2.0) as f32;
+        let wd = (w * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as f32;
         imgmarsh.draw_filled_polygon(&[vec![
             (-1.0, i),
             (wd, i),

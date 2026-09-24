@@ -13,6 +13,7 @@ use crate::io::bytes::FromToBytes;
 use crate::io::fs::FileSystem;
 use crate::io::heightmap::HeightMap;
 use crate::io::xyz::XyzInternalReader;
+use crate::mapframe::{DPI, GROUND_METRES_PER_INCH, PX_PER_METRE, WorldFile};
 use crate::palette::{Palette, PaletteColorEnum, PalettedImage};
 use crate::vec2d::Vec2D;
 
@@ -537,7 +538,7 @@ pub fn makevege(
     let scalefactor = config.scalefactor;
 
     // factor to convert from coordinates to pixels
-    let tmpfactor = (600.0 / 254.0 / scalefactor) as f32;
+    let tmpfactor = (PX_PER_METRE / scalefactor) as f32;
 
     let bf32 = block as f32;
     let hf32 = h_block as f32;
@@ -546,13 +547,13 @@ pub fn makevege(
     let mut x = 0.0_f32;
 
     let mut imgug = PalettedImage::new(
-        (w_block as f64 * block * 600.0 / 254.0 / scalefactor) as u32,
-        (h_block as f64 * block * 600.0 / 254.0 / scalefactor) as u32,
+        (w_block as f64 * block * DPI / GROUND_METRES_PER_INCH / scalefactor) as u32,
+        (h_block as f64 * block * DPI / GROUND_METRES_PER_INCH / scalefactor) as u32,
         PaletteColorEnum::Transparent.to_color(),
     );
     let mut img_ug_bit = GrayImage::from_pixel(
-        (w_block as f64 * block * 600.0 / 254.0 / scalefactor) as u32,
-        (h_block as f64 * block * 600.0 / 254.0 / scalefactor) as u32,
+        (w_block as f64 * block * DPI / GROUND_METRES_PER_INCH / scalefactor) as u32,
+        (h_block as f64 * block * DPI / GROUND_METRES_PER_INCH / scalefactor) as u32,
         Luma([0x00]),
     );
     loop {
@@ -691,6 +692,8 @@ pub fn makevege(
     let mut writer = fs
         .create(tmpfolder.join("undergrowth.pgw"))
         .expect("cannot create pgw file");
+    // Stays hand-written: the pixel sizes are f32 reciprocals and the rotation lines are the
+    // literal text "0.0", which WorldFile::write would print differently (ticket 18).
     write!(
         &mut writer,
         "{}\r\n0.0\r\n0.0\r\n{}\r\n{}\r\n{}\r\n",
@@ -704,11 +707,7 @@ pub fn makevege(
     let mut writer = fs
         .create(tmpfolder.join("vegetation.pgw"))
         .expect("cannot create pgw file");
-    write!(
-        &mut writer,
-        "1.0\r\n0.0\r\n0.0\r\n-1.0\r\n{xmin}\r\n{ymax}\r\n"
-    )
-    .expect("Cannot write pgw file");
+    WorldFile::write_unit_resolution(&mut writer, xmin, ymax).expect("Cannot write pgw file");
 
     if config.vectorvege {
         let mut ug_class = Vec2D::new(w_block_step, h_block_step, 0u8);

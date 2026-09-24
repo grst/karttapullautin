@@ -1,15 +1,17 @@
 use image::{RgbImage, Rgba, RgbaImage};
 use log::info;
-use rustc_hash::FxHashMap as HashMap;
 use std::error::Error;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::geometry::{BinaryDxf, Classification, Geometry, Point3, Points, Polylines};
+use crate::geometry::{
+    BinaryDxf, Classification, Geometry, Point2, Point3, Points, Polylines, Ring, join_polylines,
+};
 use crate::io::bytes::FromToBytes;
 use crate::io::fs::FileSystem;
 use crate::io::heightmap::HeightMap;
+use crate::mapframe::WorldFile;
 use crate::vec2d::Vec2D;
 use image::buffer::ConvertBuffer;
 
@@ -39,11 +41,10 @@ fn merge_png(
         let pgw = full_filename.replace(".png", ".pgw");
         let input = Path::new(&pgw);
         if fs.exists(input) {
-            let data = fs.read_to_string(input).expect("Can not read input file");
-            let d: Vec<&str> = data.split('\n').collect();
-            let res = d[0].trim().parse::<f64>().unwrap();
-            let tfw4 = d[4].trim().parse::<f64>().unwrap();
-            let tfw5 = d[5].trim().parse::<f64>().unwrap();
+            let w = WorldFile::read(fs, input).expect("Can not read input file");
+            let res = w.pixel_size_x;
+            let tfw4 = w.x_origin;
+            let tfw5 = w.y_origin;
 
             if res < min_res {
                 min_res = res
@@ -79,12 +80,10 @@ fn merge_png(
             let width = img.width() as f64;
             let height = img.height() as f64;
 
-            let data = fs.read_to_string(pgw).expect("Can not read input file");
-            let d: Vec<&str> = data.split('\n').collect();
-
-            let res = d[0].trim().parse::<f64>().unwrap();
-            let tfw4 = d[4].trim().parse::<f64>().unwrap();
-            let tfw5 = d[5].trim().parse::<f64>().unwrap();
+            let w = WorldFile::read(fs, pgw).expect("Can not read input file");
+            let res = w.pixel_size_x;
+            let tfw4 = w.x_origin;
+            let tfw5 = w.y_origin;
 
             let img2 = image::imageops::thumbnail(
                 &img,
@@ -126,14 +125,15 @@ fn merge_png(
     let mut tfw_file = fs
         .create(format!("{outfilename}.pgw"))
         .expect("Unable to create file");
-    write!(
-        &mut tfw_file,
-        "{}\r\n0\r\n0\r\n{}\r\n{}\r\n{}\r\n",
-        min_res * scale,
-        -min_res * scale,
-        xmin,
-        ymax
-    )
+    WorldFile {
+        pixel_size_x: min_res * scale,
+        rotation_y: 0.0,
+        rotation_x: 0.0,
+        pixel_size_y: -min_res * scale,
+        x_origin: xmin,
+        y_origin: ymax,
+    }
+    .write(&mut tfw_file)
     .expect("Could not write to file");
     drop(tfw_file);
     fs.copy(
@@ -406,6 +406,7 @@ fn decorate_depression(
         return Some((points, Classification::SmallDepression));
     }
 
+    let ring = Ring::from_xy(el_x, el_y);
     let mut best: Option<(f64, [f64; 4])> = None;
     for k in 0..CANDIDATES {
         let i = k * n / CANDIDATES;
@@ -418,10 +419,10 @@ fn decorate_depression(
         // Both perpendiculars; keep whichever ends up inside the ring.
         for (nx, ny) in [(-ty / len, tx / len), (ty / len, -tx / len)] {
             let (ex, ey) = (el_x[i] + nx * LENGTH_M, el_y[i] + ny * LENGTH_M);
-            if !point_in_ring(el_x, el_y, ex, ey) {
+            if !ring.contains(Point2::new(ex, ey)) {
                 continue;
             }
-            let clearance = distance_to_ring(el_x, el_y, ex, ey);
+            let clearance = ring.distance_to_point(Point2::new(ex, ey));
             if best.is_none_or(|(b, _)| clearance > b) {
                 best = Some((clearance, [el_x[i], el_y[i], ex, ey]));
             }
@@ -432,44 +433,6 @@ fn decorate_depression(
         vec![Point3::new(sx, sy, h), Point3::new(ex, ey, h)],
         Classification::SlopeLine,
     ))
-}
-
-/// Ray casting against the closed ring. Exact for concave shapes, which is the point.
-fn point_in_ring(el_x: &[f64], el_y: &[f64], px: f64, py: f64) -> bool {
-    let n = el_x.len();
-    let mut inside = false;
-    let mut j = n - 1;
-    for i in 0..n {
-        if (el_y[i] > py) != (el_y[j] > py) {
-            let t = (py - el_y[i]) / (el_y[j] - el_y[i]);
-            if px < el_x[i] + t * (el_x[j] - el_x[i]) {
-                inside = !inside;
-            }
-        }
-        j = i;
-    }
-    inside
-}
-
-/// Shortest distance from a point to the ring's segments — the tick's clearance.
-fn distance_to_ring(el_x: &[f64], el_y: &[f64], px: f64, py: f64) -> f64 {
-    let n = el_x.len();
-    let mut best = f64::MAX;
-    for i in 0..n {
-        let j = (i + 1) % n;
-        let (ax, ay) = (el_x[i], el_y[i]);
-        let (bx, by) = (el_x[j], el_y[j]);
-        let (dx, dy) = (bx - ax, by - ay);
-        let l2 = dx * dx + dy * dy;
-        let t = if l2 == 0.0 {
-            0.0
-        } else {
-            (((px - ax) * dx + (py - ay) * dy) / l2).clamp(0.0, 1.0)
-        };
-        let (cx, cy) = (ax + t * dx, ay + t * dy);
-        best = best.min((px - cx).powi(2) + (py - cy).powi(2));
-    }
-    best.sqrt()
 }
 
 pub fn smoothjoin(
@@ -550,130 +513,16 @@ pub fn smoothjoin(
     let knollhead_output = tmpfolder.join("knollheads.txt");
     let mut knollhead_fp = fs.create(knollhead_output).expect("Unable to create file");
 
-    // Internal type used to index into the hashmaps and vectors.
-    // Since using f64 coordinates directly has problems with rounding (and do not impl Eq and
-    // Hash), we can use an integer representation of the coordinates to index into the HashMaps.
-    // By multiplying by 1000, we can keep a precision of 3 decimal places, which is sufficient for
-    // what we need.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    struct Key {
-        x: i64,
-        y: i64,
-    }
-    impl Key {
-        fn new(x: f64, y: f64) -> Self {
-            Key {
-                x: (x * 1000.0) as i64,
-                y: (y * 1000.0) as i64,
-            }
-        }
-    }
-
-    let mut heads1: HashMap<Key, usize> = HashMap::default();
-    let mut heads2: HashMap<Key, usize> = HashMap::default();
-    let mut heads = Vec::<Key>::with_capacity(input_lines.len());
-    let mut tails = Vec::<Key>::with_capacity(input_lines.len());
-    let mut el_x = Vec::<Vec<f64>>::with_capacity(input_lines.len());
-    let mut el_y = Vec::<Vec<f64>>::with_capacity(input_lines.len());
-
-    for (j, (line, _c)) in input_lines.iter().enumerate() {
-        let first = line.first().unwrap();
-        let last = line.last().unwrap();
-
-        let head = Key::new(first.x, first.y);
-        let tail = Key::new(last.x, last.y);
-
-        heads.push(head);
-        tails.push(tail);
-
-        // TODO: this is not very efficient (collecting all x and y separately into Vecs), but it means the logic further down can stay the same
-        el_x.push(line.iter().map(|p| p.x).collect::<Vec<_>>());
-        el_y.push(line.iter().map(|p| p.y).collect::<Vec<_>>());
-
-        if *heads1.get(&head).unwrap_or(&0) == 0 {
-            heads1.insert(head, j);
-        } else {
-            heads2.insert(head, j);
-        }
-        if *heads1.get(&tail).unwrap_or(&0) == 0 {
-            heads1.insert(tail, j);
-        } else {
-            heads2.insert(tail, j);
-        }
-    }
-
-    for l in 0..input_lines.len() {
-        let mut to_join = 0;
-        if !el_x[l].is_empty() {
-            let mut end_loop = false;
-            while !end_loop {
-                let tmp = *heads1.get(&heads[l]).unwrap_or(&0);
-                if tmp != 0 && tmp != l && !el_x[tmp].is_empty() {
-                    to_join = tmp;
-                } else {
-                    let tmp = *heads2.get(&heads[l]).unwrap_or(&0);
-                    if tmp != 0 && tmp != l && !el_x[tmp].is_empty() {
-                        to_join = tmp;
-                    } else {
-                        let tmp = *heads2.get(&tails[l]).unwrap_or(&0);
-                        if tmp != 0 && tmp != l && !el_x[tmp].is_empty() {
-                            to_join = tmp;
-                        } else {
-                            let tmp = *heads1.get(&tails[l]).unwrap_or(&0);
-                            if tmp != 0 && tmp != l && !el_x[tmp].is_empty() {
-                                to_join = tmp;
-                            } else {
-                                end_loop = true;
-                            }
-                        }
-                    }
-                }
-                if !end_loop {
-                    if tails[l] == heads[to_join] {
-                        heads2.insert(tails[l], 0);
-                        heads1.insert(tails[l], 0);
-                        let mut to_append = el_x[to_join].to_vec();
-                        el_x[l].append(&mut to_append);
-                        let mut to_append = el_y[to_join].to_vec();
-                        el_y[l].append(&mut to_append);
-                        tails[l] = tails[to_join];
-                        el_x[to_join].clear();
-                    } else if tails[l] == tails[to_join] {
-                        heads2.insert(tails[l], 0);
-                        heads1.insert(tails[l], 0);
-                        let mut to_append = el_x[to_join].to_vec();
-                        to_append.reverse();
-                        el_x[l].append(&mut to_append);
-                        let mut to_append = el_y[to_join].to_vec();
-                        to_append.reverse();
-                        el_y[l].append(&mut to_append);
-                        tails[l] = heads[to_join];
-                        el_x[to_join].clear();
-                    } else if heads[l] == tails[to_join] {
-                        heads2.insert(heads[l], 0);
-                        heads1.insert(heads[l], 0);
-                        let to_append = el_x[to_join].to_vec();
-                        el_x[l].splice(0..0, to_append);
-                        let to_append = el_y[to_join].to_vec();
-                        el_y[l].splice(0..0, to_append);
-                        heads[l] = heads[to_join];
-                        el_x[to_join].clear();
-                    } else if heads[l] == heads[to_join] {
-                        heads2.insert(heads[l], 0);
-                        heads1.insert(heads[l], 0);
-                        let mut to_append = el_x[to_join].to_vec();
-                        to_append.reverse();
-                        el_x[l].splice(0..0, to_append);
-                        let mut to_append = el_y[to_join].to_vec();
-                        to_append.reverse();
-                        el_y[l].splice(0..0, to_append);
-                        heads[l] = tails[to_join];
-                        el_x[to_join].clear();
-                    }
-                }
-            }
-        }
-    }
+    let joined = join_polylines(&input_lines, usize::MAX);
+    // TODO: this is not very efficient (collecting all x and y separately into Vecs), but it means the logic further down can stay the same
+    let mut el_x: Vec<Vec<f64>> = joined
+        .iter()
+        .map(|l| l.iter().map(|p| p.x).collect())
+        .collect();
+    let mut el_y: Vec<Vec<f64>> = joined
+        .iter()
+        .map(|l| l.iter().map(|p| p.y).collect())
+        .collect();
     for l in 0..input_lines.len() {
         let mut el_x_len = el_x[l].len();
         if el_x_len > 0 {
@@ -758,27 +607,12 @@ pub fn smoothjoin(
 
                 let h_center = xyz[(foo_x, foo_y)];
 
-                let mut hit = 0;
-
                 let xtest = foo_x as f64 * size + xstart;
                 let ytest = foo_y as f64 * size + ystart;
 
-                let mut x0 = f64::NAN;
-                let mut y0 = f64::NAN;
-                for n in 0..el_x[l].len() {
-                    let x1 = el_x[l][n];
-                    let y1 = el_y[l][n];
-                    if n > 0
-                        && ((y0 <= ytest && ytest < y1) || (y1 <= ytest && ytest < y0))
-                        && (xtest < (x1 - x0) * (ytest - y0) / (y1 - y0) + x0)
-                    {
-                        hit += 1;
-                    }
-                    x0 = x1;
-                    y0 = y1;
-                }
+                let inside = Ring::from_xy(&el_x[l], &el_y[l]).contains(Point2::new(xtest, ytest));
                 depression = 1;
-                if (h_center < h && hit % 2 == 1) || (h_center > h && hit % 2 != 1) {
+                if (h_center < h && inside) || (h_center > h && !inside) {
                     depression = -1;
                     write!(&mut depr_fp, "{},{}", el_x[l][0], el_y[l][0])
                         .expect("Unable to write file");
@@ -1100,6 +934,7 @@ pub fn smoothjoin(
 mod tests {
     use super::Classification;
     use super::decorate_depression;
+    use crate::geometry::{Point2, Ring};
     // A closed ring approximating a circle of the given ground radius, in metres.
     fn ring(radius: f64) -> (Vec<f64>, Vec<f64>) {
         let (mut x, mut y) = (Vec::new(), Vec::new());
@@ -1183,7 +1018,7 @@ mod tests {
         let (x, y) = crescent();
         let (tick, _class) = decorate_depression(&x, &y, 0.0).expect("crescent is big enough");
         assert!(
-            super::point_in_ring(&x, &y, tick[1].x, tick[1].y),
+            Ring::from_xy(&x, &y).contains(Point2::new(tick[1].x, tick[1].y)),
             "tick end must be inside the ring, not outside it"
         );
     }
@@ -1194,6 +1029,6 @@ mod tests {
         let (tick, _class) = decorate_depression(&x, &y, 0.0).unwrap();
         // The crescent is 10 m wide, so a 6 m tick placed well has room to spare; the
         // failure this guards is a tick laid along or across the ring itself.
-        assert!(super::distance_to_ring(&x, &y, tick[1].x, tick[1].y) > 0.5);
+        assert!(Ring::from_xy(&x, &y).distance_to_point(Point2::new(tick[1].x, tick[1].y)) > 0.5);
     }
 }
