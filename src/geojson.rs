@@ -149,15 +149,41 @@ pub fn write_feature_collection<W: Write>(
     features: &[Value],
     crs: Option<&Value>,
 ) -> anyhow::Result<()> {
-    write_prelude(w, crs)?;
-    for (i, f) in features.iter().enumerate() {
-        if i > 0 {
-            w.write_all(b",")?;
-        }
-        serde_json::to_writer(&mut *w, f)?;
+    let mut out = FeatureWriter::new(w, crs)?;
+    for f in features {
+        out.push(f)?;
     }
-    w.write_all(b"]}")?;
-    Ok(())
+    out.finish()
+}
+
+/// A FeatureCollection written one feature at a time, for outputs too large to hold as
+/// [`Value`]s: a `Value` costs about a kilobyte per two-point cliff dash, and a steep alpine
+/// tile has millions of them.
+pub struct FeatureWriter<W: Write> {
+    w: W,
+    first: bool,
+}
+
+impl<W: Write> FeatureWriter<W> {
+    pub fn new(mut w: W, crs: Option<&Value>) -> anyhow::Result<Self> {
+        write_prelude(&mut w, crs)?;
+        Ok(Self { w, first: true })
+    }
+
+    pub fn push(&mut self, feature: &Value) -> anyhow::Result<()> {
+        if !self.first {
+            self.w.write_all(b",")?;
+        }
+        self.first = false;
+        serde_json::to_writer(&mut self.w, feature)?;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> anyhow::Result<()> {
+        self.w.write_all(b"]}")?;
+        self.w.flush()?;
+        Ok(())
+    }
 }
 
 /// ISOM 2017-2 symbol code for a KP layer name, where one exists.
@@ -208,11 +234,13 @@ pub fn bindxf_to_geojson(
     output: &std::path::Path,
     epsg: Option<u32>,
 ) -> anyhow::Result<()> {
-    let dxfs = inputs
-        .iter()
-        .map(|input| BinaryDxf::from_reader(&mut fs.open(input)?))
-        .collect::<Result<Vec<_>, _>>()?;
-    dxfs_to_geojson(fs, dxfs, output, epsg)
+    let mut out = FeatureWriter::new(BufWriter::new(fs.create(output)?), crs(epsg).as_ref())?;
+    // one input at a time: c3g.dxf.bin alone can be 150 MB on alpine rock
+    for input in inputs {
+        let dxf = BinaryDxf::from_reader(&mut fs.open(input)?)?;
+        write_dxf_features(&mut out, dxf)?;
+    }
+    out.finish()
 }
 
 /// [`bindxf_to_geojson`] for geometry already in memory.
@@ -222,47 +250,48 @@ pub fn dxfs_to_geojson(
     output: &std::path::Path,
     epsg: Option<u32>,
 ) -> anyhow::Result<()> {
-    let mut feats = Vec::new();
+    let mut out = FeatureWriter::new(BufWriter::new(fs.create(output)?), crs(epsg).as_ref())?;
     for dxf in dxfs {
-        for geom in dxf.take_geometry() {
-            match geom {
-                Geometry::Polylines2(pl) => {
-                    for (p, c) in pl.into_iter() {
-                        feats.push(feature(
-                            "LineString",
-                            coords_line(p.iter().map(|pt| [pt.x, pt.y])),
-                            &layer_props(c.to_layer()),
-                        ));
-                    }
+        write_dxf_features(&mut out, dxf)?;
+    }
+    out.finish()
+}
+
+fn write_dxf_features<W: Write>(out: &mut FeatureWriter<W>, dxf: BinaryDxf) -> anyhow::Result<()> {
+    for geom in dxf.take_geometry() {
+        match geom {
+            Geometry::Polylines2(pl) => {
+                for (p, c) in pl.into_iter() {
+                    out.push(&feature(
+                        "LineString",
+                        coords_line(p.iter().map(|pt| [pt.x, pt.y])),
+                        &layer_props(c.to_layer()),
+                    ))?;
                 }
-                Geometry::Polylines3(pl) => {
-                    for (p, (c, h)) in pl.into_iter() {
-                        let mut f = feature(
-                            "LineString",
-                            coords_line(p.iter().map(|pt| [pt.x, pt.y])),
-                            &layer_props(c.to_layer()),
-                        );
-                        f["properties"]["elevation"] = json!(h);
-                        feats.push(f);
-                    }
+            }
+            Geometry::Polylines3(pl) => {
+                for (p, (c, h)) in pl.into_iter() {
+                    let mut f = feature(
+                        "LineString",
+                        coords_line(p.iter().map(|pt| [pt.x, pt.y])),
+                        &layer_props(c.to_layer()),
+                    );
+                    f["properties"]["elevation"] = json!(h);
+                    out.push(&f)?;
                 }
-                Geometry::Points(pts) => {
-                    for (p, c) in pts.into_iter() {
-                        feats.push(feature(
-                            "Point",
-                            json!([r2(p.x), r2(p.y)]),
-                            &layer_props(c.to_layer()),
-                        ));
-                    }
+            }
+            Geometry::Points(pts) => {
+                for (p, c) in pts.into_iter() {
+                    out.push(&feature(
+                        "Point",
+                        json!([r2(p.x), r2(p.y)]),
+                        &layer_props(c.to_layer()),
+                    ))?;
                 }
             }
         }
     }
-    write_feature_collection(
-        &mut BufWriter::new(fs.create(output)?),
-        &feats,
-        crs(epsg).as_ref(),
-    )
+    Ok(())
 }
 
 fn parse_line(coords: &Value) -> Vec<[f64; 2]> {
@@ -1115,37 +1144,117 @@ pub fn publish_tile(
         write(name, &out)?;
     }
 
-    if let Some(features) = read_features(fs, &tmpfolder.join("cliffs.geojson"))? {
-        let (mut dashes_202, mut dashes_201) = (Vec::new(), Vec::new());
-        for f in &features {
-            for pts in line_parts(&f["geometry"]) {
-                let (Some(a), Some(b)) = (pts.first(), pts.last()) else {
-                    continue;
-                };
-                if f["properties"]["isom"] == "202" {
-                    dashes_202.push([*a, *b]);
-                } else {
-                    dashes_201.push([*a, *b]);
-                }
-            }
-        }
-        let mut out = Vec::new();
+    let cliffs = tmpfolder.join("cliffs.geojson");
+    if fs.exists(&cliffs) {
+        // Read as dashes, never as Values: the raw file holds millions of them on alpine rock,
+        // and as a Value tree that was over 10 GB for a single tile.
+        let RawCliffs {
+            dashes_202,
+            dashes_201,
+        } = serde_json::from_reader(BufReader::new(fs.open(&cliffs)?))?;
+        let mut out = FeatureWriter::new(BufWriter::new(fs.create(&cliffs)?), crs.as_ref())?;
         for (dashes, layer, isom) in [
             (&dashes_202, "cliff2", "202"),
             (&dashes_201, "cliff3", "201"),
         ] {
             for face in cliff_faces(dashes) {
                 let parts = face.into_iter().map(coords_line).collect();
-                out.push(json!({
+                out.push(&json!({
                     "type": "Feature",
                     "properties": {"layer": layer, "isom": isom},
                     "geometry": {"type": "MultiLineString", "coordinates": Value::Array(parts)},
-                }));
+                }))?;
             }
         }
-        write("cliffs", &out)?;
+        out.finish()?;
     }
     Ok(())
+}
+
+/// The dashes of a raw `cliffs.geojson`, by symbol, deserialized feature by feature so that no
+/// feature outlives the two end points taken from it.
+struct RawCliffs {
+    dashes_202: Vec<Dash>,
+    dashes_201: Vec<Dash>,
+}
+
+impl<'de> serde::Deserialize<'de> for RawCliffs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+        #[derive(serde::Deserialize)]
+        struct Properties {
+            isom: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type", content = "coordinates")]
+        enum Lines {
+            LineString(Vec<[f64; 2]>),
+            MultiLineString(Vec<Vec<[f64; 2]>>),
+        }
+        #[derive(serde::Deserialize)]
+        struct Feature {
+            properties: Properties,
+            geometry: Lines,
+        }
+
+        struct Features<'a>(&'a mut RawCliffs);
+        impl<'de> serde::de::DeserializeSeed<'de> for Features<'_> {
+            type Value = ();
+            fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+                d.deserialize_seq(self)
+            }
+        }
+        impl<'de> Visitor<'de> for Features<'_> {
+            type Value = ();
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of cliff features")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+                while let Some(f) = seq.next_element::<Feature>()? {
+                    let parts = match f.geometry {
+                        Lines::LineString(pts) => vec![pts],
+                        Lines::MultiLineString(parts) => parts,
+                    };
+                    let dashes = if f.properties.isom.as_deref() == Some("202") {
+                        &mut self.0.dashes_202
+                    } else {
+                        &mut self.0.dashes_201
+                    };
+                    for pts in parts {
+                        if let (Some(a), Some(b)) = (pts.first(), pts.last()) {
+                            dashes.push([*a, *b]);
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        struct Collection;
+        impl<'de> Visitor<'de> for Collection {
+            type Value = RawCliffs;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a GeoJSON FeatureCollection")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<RawCliffs, A::Error> {
+                let mut cliffs = RawCliffs {
+                    dashes_202: Vec::new(),
+                    dashes_201: Vec::new(),
+                };
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "features" {
+                        map.next_value_seed(Features(&mut cliffs))?;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(cliffs)
+            }
+        }
+
+        d.deserialize_map(Collection)
+    }
 }
 
 /// Combine the merged per-tile outputs, already in their published form (see
