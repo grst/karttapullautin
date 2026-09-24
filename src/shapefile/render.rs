@@ -17,7 +17,7 @@ use crate::{
     },
 };
 use shapefile::dbase::{FieldValue, Record};
-use shapefile::{Polygon, Polyline, Shape, ShapeType};
+use shapefile::{Polygon, PolygonRing, Polyline, Shape, ShapeType};
 
 #[derive(PartialEq, Eq)]
 enum EdgeImage {
@@ -690,15 +690,25 @@ pub fn render(
                 } else if area && shapetype == ShapeType::Polygon {
                     let polygon = Polygon::try_from(shape).unwrap();
                     if let Some(m) = matched {
-                        geo_areas.push((
-                            m.isom.clone(),
-                            m.description.clone(),
-                            polygon
-                                .rings()
-                                .iter()
-                                .map(|ring| ring.points().iter().map(|pt| [pt.x, pt.y]).collect())
-                                .collect(),
-                        ));
+                        // A shapefile polygon may hold several outer rings, each followed by
+                        // its holes; GeoJSON reads every ring after the first as a hole, so
+                        // each outer ring becomes a polygon of its own.
+                        let first = geo_areas.len();
+                        for ring in polygon.rings() {
+                            let pts = ring.points().iter().map(|pt| [pt.x, pt.y]).collect();
+                            match ring {
+                                PolygonRing::Outer(_) => geo_areas.push((
+                                    m.isom.clone(),
+                                    m.description.clone(),
+                                    vec![pts],
+                                )),
+                                // a hole before any outer ring of this shape has none to go in
+                                PolygonRing::Inner(_) if geo_areas.len() > first => {
+                                    geo_areas.last_mut().unwrap().2.push(pts);
+                                }
+                                PolygonRing::Inner(_) => {}
+                            }
+                        }
                     }
                     let mut polys: Vec<Vec<(f32, f32)>> = vec![];
                     for ring in polygon.rings().iter() {
@@ -808,7 +818,7 @@ pub fn render(
         .save_as(fs, &low_file)
         .expect("could not save low.png");
 
-    // Property schema: see `schema/geojson.schema.json` ($defs/OsmLineProperties, OsmAreaProperties).
+    // Property schema: see `schema/geojson.schema.json` ($defs/OsmProperties).
     // vector export of the matched OSM features, in world coordinates
     if !vectorconf_mappings.is_empty() {
         let to_features = |feats: &[GeoFeature], gtype: &str| {
@@ -823,7 +833,11 @@ pub fn render(
                                 .map(|p| crate::geojson::coords_line(p.iter().copied()))
                                 .collect(),
                         ),
-                        &[("isom", isom.as_str()), ("category", category.as_str())],
+                        &[
+                            ("layer", isom.as_str()),
+                            ("isom", isom.as_str()),
+                            ("category", category.as_str()),
+                        ],
                     )
                 })
                 .collect::<Vec<_>>()
