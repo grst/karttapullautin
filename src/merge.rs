@@ -653,12 +653,22 @@ pub fn smoothjoin(
 
                 let h_center = xyz[(foo_x, foo_y)];
 
-                let xtest = foo_x as f64 * size + xstart;
-                let ytest = foo_y as f64 * size + ystart;
-
-                let inside = Ring::from_xy(&el_x[l], &el_y[l]).contains(Point2::new(xtest, ytest));
+                // A depression is a ring with lower ground inside. Decided by the same vote
+                // along the whole ring that orients every contour, rather than by the height at
+                // one grid point near it, which on a small or narrow ring can fall on the wrong
+                // side of the line and turn a hill into a depression.
+                let counter_clockwise = el_x[l]
+                    .iter()
+                    .zip(&el_y[l])
+                    .zip(el_x[l].iter().zip(&el_y[l]).skip(1))
+                    .map(|((x0, y0), (x1, y1))| x0 * y1 - x1 * y0)
+                    .sum::<f64>()
+                    > 0.0;
+                let lower_inside =
+                    downhill_on_left(&xyz, xstart, ystart, size, &el_x[l], &el_y[l], h)
+                        == counter_clockwise;
                 depression = 1;
-                if (h_center < h && inside) || (h_center > h && !inside) {
+                if lower_inside {
                     depression = -1;
                     write!(&mut depr_fp, "{},{}", el_x[l][0], el_y[l][0])
                         .expect("Unable to write file");
