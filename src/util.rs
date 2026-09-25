@@ -159,12 +159,17 @@ pub fn write_object<W: std::io::Write, O: serde::Serialize>(
 ///
 /// [`Producer::push`] blocks when the queue contains `capacity` items, resuming once a consumer
 /// pops an item. This provides backpressure so the producer cannot outpace consumers.
+///
+/// The queue counts its live [`Consumer`]s. Once the last one is dropped -- including by a worker
+/// thread unwinding from a panic -- nothing will ever make room again, so `push` hands the item
+/// back instead of waiting forever.
 pub fn make_bounded_queue<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     assert!(capacity > 0, "queue capacity must be at least 1");
     let inner = Inner {
         inner: Mutex::new(InnerMut {
             queue: VecDeque::new(),
             has_closed: false,
+            consumers: 1,
         }),
         capacity,
         var_has_items: Condvar::new(),
@@ -189,6 +194,8 @@ struct Inner<T> {
 struct InnerMut<T> {
     queue: VecDeque<T>,
     has_closed: bool,
+    /// Live [`Consumer`] handles.
+    consumers: usize,
 }
 
 pub struct Producer<T> {
@@ -197,15 +204,24 @@ pub struct Producer<T> {
 
 impl<T> Producer<T> {
     /// Pushes an item to the queue. Blocks if the queue is at capacity until space is available.
-    pub fn push(&self, item: T) {
+    ///
+    /// Returns the item as an error if there are no consumers left to take it.
+    pub fn push(&self, item: T) -> Result<(), T> {
         let start = Instant::now();
         let mut inner = self.inner.inner.lock().unwrap();
-        while inner.queue.len() >= self.inner.capacity {
+        loop {
+            if inner.consumers == 0 {
+                return Err(item);
+            }
+            if inner.queue.len() < self.inner.capacity {
+                break;
+            }
             inner = self.inner.var_has_space.wait(inner).unwrap();
         }
         inner.queue.push_back(item);
         self.inner.var_has_items.notify_one();
         log::debug!("Waited {:.2?} to push item to queue", start.elapsed());
+        Ok(())
     }
 }
 
@@ -217,9 +233,27 @@ impl<T> Drop for Producer<T> {
     }
 }
 
-#[derive(Clone)]
 pub struct Consumer<T> {
     inner: Arc<Inner<T>>,
+}
+
+impl<T> Clone for Consumer<T> {
+    fn clone(&self) -> Self {
+        self.inner.inner.lock().unwrap().consumers += 1;
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> Drop for Consumer<T> {
+    fn drop(&mut self) {
+        // Runs while a worker unwinds from a panic, too, so a poisoned lock must not panic again.
+        let mut inner = self.inner.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.consumers -= 1;
+        // A producer waiting for space must learn that nobody will ever make it.
+        self.inner.var_has_space.notify_all();
+    }
 }
 
 impl<T> Consumer<T> {
@@ -252,7 +286,7 @@ mod tests {
 
         let producer_thread = thread::spawn(move || {
             for i in 0..10 {
-                producer.push(i);
+                producer.push(i).unwrap();
             }
         });
 
@@ -276,7 +310,7 @@ mod tests {
 
         let producer_thread = thread::spawn(move || {
             for i in 0..10 {
-                producer.push(i);
+                producer.push(i).unwrap();
             }
         });
 
@@ -299,7 +333,7 @@ mod tests {
 
         let producer_thread = thread::spawn(move || {
             for i in 0..10 {
-                producer.push(i);
+                producer.push(i).unwrap();
             }
         });
 
@@ -337,5 +371,39 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>(),
             (0..10).collect::<std::collections::HashSet<_>>()
         );
+    }
+
+    #[test]
+    fn push_fails_once_every_consumer_is_gone() {
+        let (producer, consumer) = make_bounded_queue(1);
+        let second = consumer.clone();
+        drop(consumer);
+        producer.push(1).unwrap();
+        drop(second);
+        // the queue is full and nobody is left to empty it
+        assert_eq!(producer.push(2), Err(2));
+    }
+
+    /// The situation of a batch run with processes=1 whose only worker panics on a tile: the
+    /// producer must not wait forever for space that nobody will make.
+    #[test]
+    fn push_does_not_hang_when_the_only_consumer_panics() {
+        let (producer, consumer) = make_bounded_queue(1);
+        let worker = thread::spawn(move || {
+            let _ = consumer.pop();
+            panic!("the worker died on this item");
+        });
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let pushed = (0..10).take_while(|&i| producer.push(i).is_ok()).count();
+            done_tx.send(pushed).unwrap();
+        });
+
+        let pushed = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the producer is stuck waiting for a consumer that has died");
+        assert!(pushed < 10);
+        assert!(worker.join().is_err());
     }
 }

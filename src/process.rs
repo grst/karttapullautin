@@ -112,6 +112,9 @@ pub fn launch_threads<F: FileSystem + Send + Clone + 'static>(
             .expect("Could not spawn thread");
         handles.push(handle);
     }
+    // The workers hold their own handles. Keeping this one would count as a live consumer forever
+    // and let `tx.push` wait for a worker that has already died.
+    drop(rx);
 
     let mut planner = plan.extract_once_planner();
 
@@ -134,7 +137,7 @@ pub fn launch_threads<F: FileSystem + Send + Clone + 'static>(
     let mut rng = rand::rng();
     let randdist = rand::distr::Bernoulli::new(thinfactor).unwrap();
 
-    while let Some(ops) = planner.next_operation() {
+    'plan: while let Some(ops) = planner.next_operation() {
         for op in ops {
             match op {
                 Operation::Extract { from, to } => {
@@ -230,7 +233,12 @@ pub fn launch_threads<F: FileSystem + Send + Clone + 'static>(
 
                     // finally post output file for processing!
                     // This will block the main thread if the queue is full to provide backpressure.
-                    tx.push(tile);
+                    if tx.push(tile).is_err() {
+                        // Every worker has exited, i.e. panicked: nothing will take the tile. Stop
+                        // planning and join them below, which propagates their panic.
+                        log::error!("All worker threads have exited; not queueing further tiles");
+                        break 'plan;
+                    }
                 }
             }
         }
