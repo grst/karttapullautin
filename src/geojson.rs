@@ -847,6 +847,162 @@ fn published_pieces(layer: &str, pts: &[[f64; 2]], knolls: &[[f64; 2]]) -> Vec<V
     conform_contour(layer, pts, knolls)
 }
 
+/// One area the contour family is hidden under, with its bounding box for a cheap reject.
+struct MaskArea {
+    rings: Vec<Vec<[f64; 2]>>,
+    min: [f64; 2],
+    max: [f64; 2],
+}
+
+impl MaskArea {
+    fn new(rings: Vec<Vec<[f64; 2]>>) -> Option<Self> {
+        let pts = rings.iter().flatten();
+        let min = pts
+            .clone()
+            .fold([f64::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]);
+        let max = pts.fold([f64::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]);
+        (min[0] < max[0] && min[1] < max[1]).then_some(Self { rings, min, max })
+    }
+
+    fn overlaps(&self, min: [f64; 2], max: [f64; 2]) -> bool {
+        self.min[0] <= max[0]
+            && min[0] <= self.max[0]
+            && self.min[1] <= max[1]
+            && min[1] <= self.max[1]
+    }
+
+    /// Even-odd over all rings, so a hole (an island) is outside.
+    fn contains(&self, p: [f64; 2]) -> bool {
+        if !self.overlaps(p, p) {
+            return false;
+        }
+        let mut inside = false;
+        for ring in &self.rings {
+            for w in ring.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                if (a[1] > p[1]) != (b[1] > p[1])
+                    && p[0] < a[0] + (p[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0])
+                {
+                    inside = !inside;
+                }
+            }
+        }
+        inside
+    }
+
+    /// Where the segment a-b crosses this area's boundary, as fractions of its length.
+    fn crossings(&self, a: [f64; 2], b: [f64; 2], out: &mut Vec<f64>) {
+        let d = [b[0] - a[0], b[1] - a[1]];
+        for ring in &self.rings {
+            for w in ring.windows(2) {
+                let (c, e) = (w[0], w[1]);
+                let f = [e[0] - c[0], e[1] - c[1]];
+                let denom = d[0] * f[1] - d[1] * f[0];
+                if denom == 0.0 {
+                    continue;
+                }
+                let g = [c[0] - a[0], c[1] - a[1]];
+                let t = (g[0] * f[1] - g[1] * f[0]) / denom;
+                let u = (g[0] * d[1] - g[1] * d[0]) / denom;
+                if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+                    out.push(t);
+                }
+            }
+        }
+    }
+}
+
+/// The OSM areas whose vectorconf rule has one of `categories` as its description: lakes,
+/// typically. LiDAR has no ground on open water, so karttapullautin traces contours across a
+/// lake from whatever it interpolates there, and they would be drawn over the water.
+fn read_mask(
+    fs: &impl FileSystem,
+    tmpfolder: &Path,
+    categories: &[String],
+) -> anyhow::Result<Vec<MaskArea>> {
+    if categories.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(features) = read_features(fs, &tmpfolder.join("osm_areas.geojson"))? else {
+        return Ok(Vec::new());
+    };
+    Ok(features
+        .iter()
+        .filter(|f| {
+            f["properties"]["category"]
+                .as_str()
+                .is_some_and(|c| categories.iter().any(|m| m == c))
+        })
+        .filter_map(|f| MaskArea::new(polygon_rings(&f["geometry"])))
+        .collect())
+}
+
+fn masked(mask: &[MaskArea], p: [f64; 2]) -> bool {
+    mask.iter().any(|m| m.contains(p))
+}
+
+/// The pieces of a line that lie outside every mask area, cut exactly where the line crosses
+/// an area's boundary. Pieces are kept in order; a line that never comes near an area is
+/// returned as it is.
+fn mask_line(pts: Vec<[f64; 2]>, mask: &[MaskArea]) -> Vec<Vec<[f64; 2]>> {
+    let lo = pts
+        .iter()
+        .fold([f64::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]);
+    let hi = pts
+        .iter()
+        .fold([f64::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]);
+    let near: Vec<&MaskArea> = mask.iter().filter(|m| m.overlaps(lo, hi)).collect();
+    if near.is_empty() || pts.len() < 2 {
+        return vec![pts];
+    }
+    // the vertices themselves stay exact, so a line keeps the vertices it shares with its
+    // continuation in the next tile
+    let at = |a: [f64; 2], b: [f64; 2], t: f64| match t {
+        0.0 => a,
+        1.0 => b,
+        _ => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t],
+    };
+    let inside = |p: [f64; 2]| near.iter().any(|m| m.contains(p));
+
+    let mut pieces = Vec::new();
+    let mut cur: Vec<[f64; 2]> = Vec::new();
+    let mut ts = Vec::new();
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let smin = [a[0].min(b[0]), a[1].min(b[1])];
+        let smax = [a[0].max(b[0]), a[1].max(b[1])];
+        ts.clear();
+        ts.push(0.0);
+        for m in near.iter().filter(|m| m.overlaps(smin, smax)) {
+            m.crossings(a, b, &mut ts);
+        }
+        ts.push(1.0);
+        ts.sort_by(f64::total_cmp);
+        for span in ts.windows(2) {
+            let (t0, t1) = (span[0], span[1]);
+            if t1 - t0 < 1e-9 {
+                continue;
+            }
+            if inside(at(a, b, (t0 + t1) / 2.0)) {
+                if cur.len() > 1 {
+                    pieces.push(std::mem::take(&mut cur));
+                }
+                cur.clear();
+            } else {
+                let start = at(a, b, t0);
+                if cur.last() != Some(&start) {
+                    cur.push(start);
+                }
+                cur.push(at(a, b, t1));
+            }
+        }
+    }
+    if cur.len() > 1 {
+        pieces.push(cur);
+    }
+    pieces
+}
+
 /// Groups of points that lie within CLIFF_CLUSTER_DIST of each other, transitively (a
 /// union-find over a grid of that size), each group in ascending index order and the groups
 /// in order of their first point.
@@ -1167,6 +1323,51 @@ pub fn publish_tile(
             }
         }
         out.finish()?;
+    }
+    Ok(())
+}
+
+/// Leave out the published contours, form lines and knolls that lie inside the OSM areas whose
+/// vectorconf rule has one of `categories` as its description (e.g. `lake`), cutting the lines
+/// exactly where they cross the shore ([`mask_line`]). Rewrites the files in place.
+///
+/// Runs after the shapefile pass, which is what writes `osm_areas.geojson`, and like
+/// [`publish_tile`] on the padded tile, so both sides of a tile edge are cut by the same shore.
+pub fn mask_contours(
+    fs: &impl FileSystem,
+    tmpfolder: &Path,
+    categories: &[String],
+    epsg: Option<u32>,
+) -> anyhow::Result<()> {
+    let mask = read_mask(fs, tmpfolder, categories)?;
+    if mask.is_empty() {
+        return Ok(());
+    }
+    let crs = crs(epsg);
+    for name in ["contours", "formlines", "dotknolls"] {
+        let path = tmpfolder.join(format!("{name}.geojson"));
+        let Some(features) = read_features(fs, &path)? else {
+            continue;
+        };
+        let mut out = Vec::with_capacity(features.len());
+        for f in features {
+            if f["geometry"]["type"].as_str() == Some("Point") {
+                let c = &f["geometry"]["coordinates"];
+                if let (Some(x), Some(y)) = (c[0].as_f64(), c[1].as_f64())
+                    && masked(&mask, [x, y])
+                {
+                    continue;
+                }
+                out.push(f);
+                continue;
+            }
+            let pieces = line_parts(&f["geometry"])
+                .into_iter()
+                .flat_map(|pts| mask_line(pts, &mask))
+                .collect();
+            out.extend(line_feature(pieces, f["properties"].clone()));
+        }
+        write_feature_collection(&mut BufWriter::new(fs.create(&path)?), &out, crs.as_ref())?;
     }
     Ok(())
 }
@@ -1759,6 +1960,36 @@ mod tests {
             2,
             "the uncertain knoll 5 m from a certain one must give way"
         );
+    }
+
+    #[test]
+    fn mask_line_cuts_at_the_shore_and_keeps_islands() {
+        // a 10 x 10 lake with a 2 x 2 island in the middle
+        let lake = MaskArea::new(vec![
+            vec![
+                [0.0, 0.0],
+                [10.0, 0.0],
+                [10.0, 10.0],
+                [0.0, 10.0],
+                [0.0, 0.0],
+            ],
+            vec![[4.0, 4.0], [4.0, 6.0], [6.0, 6.0], [6.0, 4.0], [4.0, 4.0]],
+        ])
+        .unwrap();
+        let mask = [lake];
+        let pieces = mask_line(vec![[-5.0, 5.0], [15.0, 5.0]], &mask);
+        assert_eq!(
+            pieces,
+            vec![
+                vec![[-5.0, 5.0], [0.0, 5.0]],
+                vec![[4.0, 5.0], [6.0, 5.0]],
+                vec![[10.0, 5.0], [15.0, 5.0]],
+            ]
+        );
+        // a line nowhere near it is returned untouched, vertices and all
+        let away = vec![[20.0, 0.0], [21.0, 1.0], [22.0, 0.0]];
+        assert_eq!(mask_line(away.clone(), &mask), vec![away]);
+        assert!(masked(&mask, [2.0, 2.0]) && !masked(&mask, [5.0, 5.0]));
     }
 
     #[test]

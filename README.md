@@ -129,6 +129,8 @@ With `vectorvege=1` Karttapullautin also writes the map as GeoJSON, one `Feature
 
 Every feature carries `layer` (Karttapullautin's own class, the DXF layer name) and `isom` (the ISOM 2017-2 symbol code, or for the shapefile features the code from the `vectorconf` file); contours also carry `elevation`. The property schema is `schema/geojson.schema.json`.
 
+LiDAR has no ground on open water, so contours traced across a lake are interpolation. `contour_mask` names `vectorconf` categories (the first field of a rule) whose areas hide the contours, form lines and knolls in the GeoJSON: with `contour_mask=lake` and a rule `lake|301|natural=water&water!=river`, the lines are cut at the shore while a river, matched by a rule of another name, keeps the contours that cross it. Batch mode, after the shapefile pass.
+
 Coordinates are in the input CRS; set `epsg` to declare it in the files. With `geojson_wgs84=1` (batch mode, `epsg` required) the per-tile files are instead reprojected to WGS84 longitude/latitude, which is what tools such as [tippecanoe](https://github.com/felt/tippecanoe) read, so they can go straight into a vector tile pyramid:
 
     tippecanoe -e tiles -L contours:out/593_5269_contours.geojson -L vegetation:out/593_5269_vegetation.geojson ...

@@ -712,6 +712,10 @@ pub fn batch_process(
 
         if has_zip && !vegeonly && !cliffsonly && !contoursonly {
             process_zip(fs, conf, thread, &tmpfolder, &[], true).unwrap();
+            if conf.vectorvege && !conf.contour_mask.is_empty() {
+                crate::geojson::mask_contours(fs, &tmpfolder, &conf.contour_mask, conf.epsg)
+                    .unwrap();
+            }
         }
 
         // crop

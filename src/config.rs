@@ -120,6 +120,9 @@ pub struct Config {
     // render
     pub buildingcolor: (u8, u8, u8),
     pub vectorconf: String,
+    /// vectorconf categories (rule descriptions) whose areas hide the contours, form lines and
+    /// knolls in the vector output.
+    pub contour_mask: Vec<String>,
     pub mtkskiplayers: Vec<String>,
     pub cliffdebug: bool,
 
@@ -354,6 +357,14 @@ impl Config {
         };
 
         let vectorconf = gs.get("vectorconf").unwrap_or("").into();
+        let contour_mask: Vec<String> = gs
+            .get("contour_mask")
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Into::into)
+            .collect();
         let mtkskiplayers: Vec<String> = gs
             .get("mtkskiplayers")
             .unwrap_or("")
@@ -487,6 +498,7 @@ impl Config {
             vegeshade,
             buildingcolor,
             vectorconf,
+            contour_mask,
             mtkskiplayers,
             cliffdebug,
             formlinesteepness,
