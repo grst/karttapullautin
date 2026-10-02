@@ -892,6 +892,88 @@ fn published_pieces(
     conform_contour(layer, pts, knolls, chaikin)
 }
 
+/// ISOM 2017-2 101: a slope line is 0.4 mm long at 1:15 000, 0.6 mm at 1:10 000 -- 6 m of ground.
+const SLOPE_LINE_M: f64 = 6.0;
+
+/// One slope line per started this much of a depression's line, so a long one shows its
+/// direction along all of it.
+const SLOPE_LINE_EVERY_M: f64 = 150.0;
+
+/// True for the published classes that run round lower ground: contour and form-line
+/// depressions. They are oriented with downhill on the right ([`publish_tile`]).
+fn is_depression_layer(layer: &str) -> bool {
+    layer.starts_with("depression") || layer == "formline_depression"
+}
+
+/// The slope lines of one published depression line: short lines from the line, at right
+/// angles to it, on its right -- downhill. ISOM 101: "a depression has to have at least one
+/// slope line", or it reads as a knoll.
+///
+/// Placed by the geometry alone, so that the two tiles that share a depression put its slope
+/// lines in the same places: on a closed ring, the first starts at the vertex closest to the
+/// ring's centre (the narrow side, so it points across the depression), the others follow
+/// evenly round the ring; on an open piece they are spread evenly along it. A slope line
+/// never reaches more than 0.45 of a small ring's width.
+fn slope_ticks(pts: &[[f64; 2]]) -> Vec<Vec<[f64; 2]>> {
+    if pts.len() < 3 {
+        return Vec::new();
+    }
+    let closed = pts.first() == pts.last();
+    let mut cum = vec![0.0];
+    for w in pts.windows(2) {
+        cum.push(cum.last().unwrap() + dist(w[0], w[1]));
+    }
+    let total = *cum.last().unwrap();
+    if total < 8.0 {
+        return Vec::new();
+    }
+    let lo = pts
+        .iter()
+        .fold([f64::MAX; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]);
+    let hi = pts
+        .iter()
+        .fold([f64::MIN; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]);
+    let length = if closed {
+        SLOPE_LINE_M.min(0.45 * (hi[0] - lo[0]).min(hi[1] - lo[1]))
+    } else {
+        SLOPE_LINE_M
+    };
+    let count = ((total / SLOPE_LINE_EVERY_M).round() as usize).max(1);
+    let start = if closed {
+        let ring = &pts[..pts.len() - 1];
+        let c = ring
+            .iter()
+            .fold([0.0, 0.0], |a, p| [a[0] + p[0], a[1] + p[1]]);
+        let c = [c[0] / ring.len() as f64, c[1] / ring.len() as f64];
+        let nearest = (0..ring.len())
+            // ties (a symmetric ring) go by position, never by where the trace began
+            .min_by(|&i, &j| {
+                (dist(ring[i], c), ring[i][0], ring[i][1])
+                    .partial_cmp(&(dist(ring[j], c), ring[j][0], ring[j][1]))
+                    .unwrap()
+            })
+            .unwrap();
+        cum[nearest]
+    } else {
+        total / count as f64 / 2.0
+    };
+    (0..count)
+        .filter_map(|k| {
+            let s = (start + k as f64 * total / count as f64) % total;
+            let i = cum.partition_point(|&c| c <= s).clamp(1, pts.len() - 1);
+            let (a, b) = (pts[i - 1], pts[i]);
+            let seg = dist(a, b);
+            if seg == 0.0 {
+                return None;
+            }
+            let t = (s - cum[i - 1]) / seg;
+            let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+            let (dx, dy) = ((b[0] - a[0]) / seg, (b[1] - a[1]) / seg);
+            Some(vec![p, [p[0] + dy * length, p[1] - dx * length]])
+        })
+        .collect()
+}
+
 /// One area the contour family is hidden under, with its bounding box for a cheap reject.
 struct MaskArea {
     rings: Vec<Vec<[f64; 2]>>,
@@ -1279,7 +1361,8 @@ fn line_feature(mut pieces: Vec<Vec<[f64; 2]>>, properties: Value) -> Option<Val
 /// * `dotknolls`: the spacing filter of [`published_knolls`];
 /// * `contours` and `formlines`: each line generalised and broken around the knoll symbols
 ///   ([`published_pieces`]), with `contour_chaikin` rounds of corner cutting
-///   ([`round_corners`]). With `formline=2` the half-interval
+///   ([`round_corners`]), and slope lines (`slope_line`, 101.1) hanging from every depression
+///   ([`slope_ticks`]). With `formline=2` the half-interval
 ///   `*_intermed` lines are only candidates -- the renderer's selection of them is
 ///   `formlines` -- so they are dropped from `contours`; in the other modes they are
 ///   drawn as full contours and published as 101;
@@ -1338,10 +1421,21 @@ pub fn publish_tile(
             let Some(isom) = properties["isom"].as_str().map(str::to_string) else {
                 continue;
             };
-            let pieces = line_parts(&f["geometry"])
+            let pieces: Vec<Vec<[f64; 2]>> = line_parts(&f["geometry"])
                 .iter()
                 .flat_map(|pts| published_pieces(&isom, pts, &knolls, contour_chaikin))
                 .collect();
+            if properties["layer"]
+                .as_str()
+                .is_some_and(is_depression_layer)
+            {
+                let ticks = pieces.iter().flat_map(|p| slope_ticks(p)).collect();
+                let mut tick_props = json!({"layer": "slope_line", "isom": "101.1"});
+                if !properties["elevation"].is_null() {
+                    tick_props["elevation"] = properties["elevation"].clone();
+                }
+                out.extend(line_feature(ticks, tick_props));
+            }
             out.extend(line_feature(pieces, properties));
         }
         write(name, &out)?;
@@ -2007,6 +2101,33 @@ mod tests {
             2,
             "the uncertain knoll 5 m from a certain one must give way"
         );
+    }
+
+    #[test]
+    fn slope_ticks_point_downhill_into_the_depression() {
+        // a clockwise 40 x 20 m ellipse: downhill (the inside) is on the right
+        let ring: Vec<[f64; 2]> = (0..=48)
+            .map(|i| {
+                let a = -f64::from(i) / 48.0 * std::f64::consts::TAU;
+                [100.0 + 20.0 * a.cos(), 200.0 + 10.0 * a.sin()]
+            })
+            .collect();
+        let ticks = slope_ticks(&ring);
+        assert_eq!(ticks.len(), 1);
+        let [start, end] = [ticks[0][0], ticks[0][1]];
+        let from_centre = |p: [f64; 2]| dist(p, [100.0, 200.0]);
+        assert!(
+            from_centre(end) < from_centre(start),
+            "the tick points inward"
+        );
+        assert!((dist(start, end) - SLOPE_LINE_M).abs() < 1e-9);
+        // on the narrow side: across the ellipse, not along it
+        assert!((start[0] - 100.0).abs() < 2.0, "{start:?}");
+        // the same ring traced from another vertex puts it in the same place
+        let mut shifted: Vec<[f64; 2]> = ring[17..48].to_vec();
+        shifted.extend_from_slice(&ring[..18]);
+        let again = slope_ticks(&shifted);
+        assert!(dist(again[0][0], start) < 1e-6);
     }
 
     #[test]

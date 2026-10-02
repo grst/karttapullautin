@@ -36,10 +36,10 @@
           "enum": [
             "cont", "contour", "contour_index", "contour_intermed", "contour_index_intermed",
             "depression", "depression_index", "depression_intermed", "depression_index_intermed",
-            "formline", "formline_depression"
+            "formline", "formline_depression", "slope_line"
           ]
         },
-        "isom": { "enum": ["101", "102", "103"] },
+        "isom": { "enum": ["101", "101.1", "102", "103"] },
         "elevation": { "type": "number" }
       }
     },

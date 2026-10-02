@@ -131,6 +131,8 @@ Every feature carries `layer` (Karttapullautin's own class, the DXF layer name) 
 
 LiDAR has no ground on open water, so contours traced across a lake are interpolation. `contour_mask` names `vectorconf` categories (the first field of a rule) whose areas hide the contours, form lines and knolls in the GeoJSON: with `contour_mask=lake` and a rule `lake|301|natural=water&water!=river`, the lines are cut at the shore while a river, matched by a rule of another name, keeps the contours that cross it. Batch mode, after the shapefile pass.
 
+Every published depression -- contour or form line, oriented with downhill on the right -- gets slope lines (`layer` `slope_line`, `isom` `101.1`): 6 m lines at right angles to it, pointing into the depression, one per started 150 m of line, placed by the geometry alone so that two tiles agree.
+
 `contour_chaikin` rounds the corners of the published contours and form lines (Chaikin corner cutting, that many rounds; 0 = off). Each new point depends only on two neighbouring vertices, so a contour stays identical across a tile edge.
 
 Pylons: a `vectorconf` rule whose code is a line code with a `P` suffix matches point shapes, the pylons of that line symbol, e.g. `pylon|516P|power=tower`. Wherever such a point is a vertex of a line of that code, a bar across the line is drawn (ISOM 510/511: 0.74 / 1.94 mm at 1:15 000), in the PNG and in `osm_lines` as further parts of the line's code.
