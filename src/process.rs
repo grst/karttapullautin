@@ -636,20 +636,28 @@ pub fn process_tile(
     } else {
         info!("Skipped rendering");
     }
-    if config.vectorvege {
+    // When rendering is skipped here, the shapefile pass (process_zip) renders instead, and
+    // its render writes the form lines: publishing has to wait for it (batch_process).
+    if config.vectorvege && !skip_rendering {
         info!("Publishing vector outputs");
         timing.start_section("publishing vector outputs");
-        crate::geojson::publish_tile(
-            fs,
-            tmpfolder,
-            config.formline,
-            config.epsg,
-            config.contour_chaikin,
-        )
-        .unwrap();
+        publish_vectors(fs, config, tmpfolder);
     }
     info!("All done!");
     Ok(())
+}
+
+/// Bring the tile's vector outputs into their published form ([`crate::geojson::publish_tile`]).
+/// Runs once per tile, after the last render: a render rewrites `formlines.geojson`.
+fn publish_vectors(fs: &impl FileSystem, config: &Config, tmpfolder: &Path) {
+    crate::geojson::publish_tile(
+        fs,
+        tmpfolder,
+        config.formline,
+        config.epsg,
+        config.contour_chaikin,
+    )
+    .unwrap();
 }
 
 pub fn batch_process(
@@ -719,10 +727,21 @@ pub fn batch_process(
 
         if has_zip && !vegeonly && !cliffsonly && !contoursonly {
             process_zip(fs, conf, thread, &tmpfolder, &[], true).unwrap();
-            if conf.vectorvege && !conf.contour_mask.is_empty() {
-                crate::geojson::mask_contours(fs, &tmpfolder, &conf.contour_mask, conf.epsg)
-                    .unwrap();
-            }
+        }
+        // process_tile left publishing to here: the shapefile pass renders the map, and with it
+        // the form lines, after process_tile has finished.
+        if has_zip && conf.vectorvege {
+            info!("Publishing vector outputs");
+            publish_vectors(fs, conf, &tmpfolder);
+        }
+        if has_zip
+            && !vegeonly
+            && !cliffsonly
+            && !contoursonly
+            && conf.vectorvege
+            && !conf.contour_mask.is_empty()
+        {
+            crate::geojson::mask_contours(fs, &tmpfolder, &conf.contour_mask, conf.epsg).unwrap();
         }
 
         // crop
