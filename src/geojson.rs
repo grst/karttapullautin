@@ -832,19 +832,64 @@ fn is_contour_family(layer: &str) -> bool {
 /// Apply the ISOM contour rules to one published line: generalise detail below what the
 /// symbol can carry, then break where a knoll symbol needs room. Anything that is not a
 /// contour passes through as a single piece, untouched.
-fn conform_contour(layer: &str, pts: &[[f64; 2]], knolls: &[[f64; 2]]) -> Vec<Vec<[f64; 2]>> {
+fn conform_contour(
+    layer: &str,
+    pts: &[[f64; 2]],
+    knolls: &[[f64; 2]],
+    chaikin: u32,
+) -> Vec<Vec<[f64; 2]>> {
     if !is_contour_family(layer) {
         return vec![pts.to_vec()];
     }
-    break_at_knolls(&generalise_contour(pts), knolls)
+    break_at_knolls(&round_corners(&generalise_contour(pts), chaikin), knolls)
+}
+
+/// `iterations` rounds of Chaikin corner cutting: every corner is replaced by two points a
+/// quarter of the way along its segments, so the line keeps its course and loses its kinks.
+/// A closed ring stays closed. Each new point depends on two neighbouring vertices only, so a
+/// contour that is vertex-for-vertex identical in two tiles stays identical; only its ends,
+/// at the padded tile's edge, move.
+fn round_corners(pts: &[[f64; 2]], iterations: u32) -> Vec<[f64; 2]> {
+    let mut pts = pts.to_vec();
+    for _ in 0..iterations {
+        if pts.len() < 3 {
+            break;
+        }
+        let closed = pts.first() == pts.last();
+        let cut = |a: [f64; 2], b: [f64; 2]| {
+            [
+                [0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1]],
+                [0.25 * a[0] + 0.75 * b[0], 0.25 * a[1] + 0.75 * b[1]],
+            ]
+        };
+        let mut out = Vec::with_capacity(2 * pts.len());
+        if !closed {
+            out.push(pts[0]);
+        }
+        for w in pts.windows(2) {
+            out.extend(cut(w[0], w[1]));
+        }
+        if closed {
+            out.push(out[0]);
+        } else {
+            out.push(pts[pts.len() - 1]);
+        }
+        pts = out;
+    }
+    pts
 }
 
 /// The pieces of one line as published: generalised to the ISOM minimums and broken around
 /// the knoll symbols. No curve is fitted: the line is karttapullautin's own smoothed contour,
 /// the one the rendered map draws, and a fit that depends on the whole line (a
 /// Douglas-Peucker thinning, say) would come out differently in the two tiles that share it.
-fn published_pieces(layer: &str, pts: &[[f64; 2]], knolls: &[[f64; 2]]) -> Vec<Vec<[f64; 2]>> {
-    conform_contour(layer, pts, knolls)
+fn published_pieces(
+    layer: &str,
+    pts: &[[f64; 2]],
+    knolls: &[[f64; 2]],
+    chaikin: u32,
+) -> Vec<Vec<[f64; 2]>> {
+    conform_contour(layer, pts, knolls, chaikin)
 }
 
 /// One area the contour family is hidden under, with its bounding box for a cheap reject.
@@ -1233,7 +1278,8 @@ fn line_feature(mut pieces: Vec<Vec<[f64; 2]>>, properties: Value) -> Option<Val
 ///
 /// * `dotknolls`: the spacing filter of [`published_knolls`];
 /// * `contours` and `formlines`: each line generalised and broken around the knoll symbols
-///   ([`published_pieces`]). With `formline=2` the half-interval
+///   ([`published_pieces`]), with `contour_chaikin` rounds of corner cutting
+///   ([`round_corners`]). With `formline=2` the half-interval
 ///   `*_intermed` lines are only candidates -- the renderer's selection of them is
 ///   `formlines` -- so they are dropped from `contours`; in the other modes they are
 ///   drawn as full contours and published as 101;
@@ -1249,6 +1295,7 @@ pub fn publish_tile(
     tmpfolder: &Path,
     formline: f64,
     epsg: Option<u32>,
+    contour_chaikin: u32,
 ) -> anyhow::Result<()> {
     let crs = crs(epsg);
     let write = |name: &str, features: &[Value]| -> anyhow::Result<()> {
@@ -1293,7 +1340,7 @@ pub fn publish_tile(
             };
             let pieces = line_parts(&f["geometry"])
                 .iter()
-                .flat_map(|pts| published_pieces(&isom, pts, &knolls))
+                .flat_map(|pts| published_pieces(&isom, pts, &knolls, contour_chaikin))
                 .collect();
             out.extend(line_feature(pieces, properties));
         }
@@ -1928,7 +1975,7 @@ mod tests {
         }
         write("cliffs", Geometry::Polylines2(cliffs));
 
-        publish_tile(&fs, Path::new(""), 2.0, Some(25832)).unwrap();
+        publish_tile(&fs, Path::new(""), 2.0, Some(25832), 0).unwrap();
 
         for name in ["contours", "formlines", "dotknolls", "cliffs"] {
             let val: Value =
@@ -1960,6 +2007,21 @@ mod tests {
             2,
             "the uncertain knoll 5 m from a certain one must give way"
         );
+    }
+
+    #[test]
+    fn round_corners_keeps_ends_and_closes_rings() {
+        let open = [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0]];
+        let once = round_corners(&open, 1);
+        assert_eq!(once.first(), Some(&[0.0, 0.0]));
+        assert_eq!(once.last(), Some(&[4.0, 4.0]));
+        assert!(once.contains(&[3.0, 0.0]) && once.contains(&[4.0, 1.0]));
+        assert!(!once.contains(&[4.0, 0.0]), "the corner is cut");
+        let ring = [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]];
+        let twice = round_corners(&ring, 2);
+        assert_eq!(twice.first(), twice.last());
+        assert_eq!(twice.len(), 17);
+        assert_eq!(round_corners(&ring, 0), ring.to_vec());
     }
 
     #[test]

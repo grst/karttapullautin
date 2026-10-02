@@ -123,6 +123,8 @@ pub struct Config {
     /// vectorconf categories (rule descriptions) whose areas hide the contours, form lines and
     /// knolls in the vector output.
     pub contour_mask: Vec<String>,
+    /// Rounds of Chaikin corner cutting on the published contours and form lines.
+    pub contour_chaikin: u32,
     pub mtkskiplayers: Vec<String>,
     pub cliffdebug: bool,
 
@@ -357,6 +359,7 @@ impl Config {
         };
 
         let vectorconf = gs.get("vectorconf").unwrap_or("").into();
+        let contour_chaikin: u32 = parse_typed(gs, "contour_chaikin", 0);
         let contour_mask: Vec<String> = gs
             .get("contour_mask")
             .unwrap_or("")
@@ -499,6 +502,7 @@ impl Config {
             buildingcolor,
             vectorconf,
             contour_mask,
+            contour_chaikin,
             mtkskiplayers,
             cliffdebug,
             formlinesteepness,

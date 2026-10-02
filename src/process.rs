@@ -639,7 +639,14 @@ pub fn process_tile(
     if config.vectorvege {
         info!("Publishing vector outputs");
         timing.start_section("publishing vector outputs");
-        crate::geojson::publish_tile(fs, tmpfolder, config.formline, config.epsg).unwrap();
+        crate::geojson::publish_tile(
+            fs,
+            tmpfolder,
+            config.formline,
+            config.epsg,
+            config.contour_chaikin,
+        )
+        .unwrap();
     }
     info!("All done!");
     Ok(())
