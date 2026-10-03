@@ -53,9 +53,18 @@ log = "0.4"
 env_logger = "0.11"
 
 serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = "1"
 anyhow = "1"
 mimalloc = { version = "0.1", default-features = false }
 bincode-next = { version = "2.1", default-features = false, features = ["std", "serde"] }
 
 bytemuck = { version = "1.23", features = ["derive"] }
 itertools = "0.15.0"
+proj4rs = { version = "0.2", default-features = false, features = ["crs-definitions"] }
+
+[build-dependencies]
+typify = "0.8"
+schemars = "0.8"
+serde_json = "1"
+syn = "3"
+prettyplease = "0.3"

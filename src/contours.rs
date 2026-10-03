@@ -262,10 +262,16 @@ pub fn heightmap2contours(
                 .iter()
                 .enumerate()
                 .filter_map(|(i, (x, y))| {
-                    // original logic for some kind of "thinning" of the lines
+                    // original logic for some kind of "thinning" of the lines, dropping about
+                    // every other vertex away from the ends. Which vertex goes is decided by
+                    // where it is on the grid (each lies on a cell edge), not by its index along
+                    // the line: a contour crossing a tile edge starts somewhere else in each of
+                    // the two padded tiles, and index parity would thin the same line
+                    // differently on the two sides, leaving the halves up to a metre apart.
                     let ii = i + 1;
                     let ldata = polyline.len() - 1;
-                    if ii > 5 && ii < ldata - 5 && ldata > 12 && ii % 2 == 0 {
+                    let odd_cell = (x.floor() + y.floor()).rem_euclid(2.0) == 1.0;
+                    if ii > 5 && ii < ldata - 5 && ldata > 12 && odd_cell {
                         return None; // skip this point
                     }
 

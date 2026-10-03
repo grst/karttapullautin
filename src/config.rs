@@ -28,6 +28,19 @@ pub struct Config {
     pub savetempfiles: bool,
     pub savetempfolders: bool,
 
+    /// Buffer in meters read from neighboring tiles in batch mode.
+    pub batchbuffer: f64,
+
+    /// Automatically run the merge steps (pngmerge, dxfmerge, GeoJSON merge) after batch.
+    pub batchmerge: bool,
+
+    /// EPSG code of the input data's projected CRS, written to GeoJSON output.
+    /// None (key unset) omits the CRS declaration from the output.
+    pub epsg: Option<u32>,
+
+    /// Reproject the batch GeoJSON outputs from `epsg` to WGS84 longitude/latitude.
+    pub geojson_wgs84: bool,
+
     pub scalefactor: f64,
     pub vege_bitmode: bool,
     pub zoff: f64,
@@ -93,9 +106,25 @@ pub struct Config {
     pub buildings: u8,
     pub waterele: f64,
 
+    // vegetation vector export
+    pub vectorvege: bool,
+    /// ISOM code per greenshade index (1-based); shorter list repeats its last value.
+    pub greenshadeisom: Vec<u16>,
+    /// Douglas-Peucker tolerance in meters for vegetation polygons; 0 disables simplification.
+    pub vegesimplify: f64,
+
+    /// When true, vegetation polygons carry the raw greenshade index as a `shade`
+    /// property and are traced per shade rather than per ISOM class.
+    pub vegeshade: bool,
+
     // render
     pub buildingcolor: (u8, u8, u8),
     pub vectorconf: String,
+    /// vectorconf categories (rule descriptions) whose areas hide the contours, form lines and
+    /// knolls in the vector output.
+    pub contour_mask: Vec<String>,
+    /// Rounds of Chaikin corner cutting on the published contours and form lines.
+    pub contour_chaikin: u32,
     pub mtkskiplayers: Vec<String>,
     pub cliffdebug: bool,
 
@@ -173,6 +202,10 @@ impl Config {
 
         let lazfolder = gs.get("lazfolder").unwrap_or("").to_string();
         let batchoutfolder = gs.get("batchoutfolder").unwrap_or("").to_string();
+        let batchbuffer: f64 = parse_typed(gs, "batchbuffer", 127.0);
+        let batchmerge: bool = gs.get("batchmerge").unwrap_or("0") == "1";
+        let epsg: Option<u32> = gs.get("epsg").and_then(|s| s.trim().parse().ok());
+        let geojson_wgs84: bool = gs.get("geojson_wgs84").unwrap_or("0") == "1";
         let savetempfiles: bool = gs.get("savetempfiles").unwrap() == "1";
         let savetempfolders: bool = gs.get("savetempfolders").unwrap() == "1";
 
@@ -326,6 +359,15 @@ impl Config {
         };
 
         let vectorconf = gs.get("vectorconf").unwrap_or("").into();
+        let contour_chaikin: u32 = parse_typed(gs, "contour_chaikin", 0);
+        let contour_mask: Vec<String> = gs
+            .get("contour_mask")
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Into::into)
+            .collect();
         let mtkskiplayers: Vec<String> = gs
             .get("mtkskiplayers")
             .unwrap_or("")
@@ -356,8 +398,24 @@ impl Config {
             )
         };
         let decorate_depressions = gs.get("decorate_depressions").unwrap_or("0") == "1";
+        let vectorvege: bool = gs.get("vectorvege").unwrap_or("0") == "1";
+        let greenshadeisom: Vec<u16> = gs
+            .get("greenshadeisom")
+            .unwrap_or("406|406|408|408|410")
+            .split('|')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let vegesimplify: f64 = parse_typed(gs, "vegesimplify", 2.0);
+        let vegeshade: bool = gs.get("vegeshade").unwrap_or("0") == "1";
 
         let batch = gs.get("batch").unwrap() == "1";
+        if geojson_wgs84 && (epsg.is_none() || !batch) {
+            return Err(
+                "`geojson_wgs84=1` needs `epsg` (the CRS to reproject from) and `batch=1`"
+                    .to_string()
+                    .into(),
+            );
+        }
         if batch && processes == 0 {
             return Err(
                 "Value of `processes` cannot be zero if parameter `batch` is 1"
@@ -378,6 +436,10 @@ impl Config {
             pnorthlineswidth,
             lazfolder,
             batchoutfolder,
+            batchbuffer,
+            batchmerge,
+            epsg,
+            geojson_wgs84,
             savetempfolders,
             savetempfiles,
             scalefactor,
@@ -433,8 +495,14 @@ impl Config {
             water,
             buildings,
             waterele,
+            vectorvege,
+            greenshadeisom,
+            vegesimplify,
+            vegeshade,
             buildingcolor,
             vectorconf,
+            contour_mask,
+            contour_chaikin,
             mtkskiplayers,
             cliffdebug,
             formlinesteepness,

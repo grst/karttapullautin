@@ -29,3 +29,5 @@ callgrind.out.*
 perf.data*
 *.svg
 *.xyz.bin
+e2e_in/
+e2e_out/

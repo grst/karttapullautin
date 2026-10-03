@@ -1,0 +1,6 @@
+# JSON Schema files - source of truth, not generated
+schema/*.json linguist-language=JSON
+
+# typify-generated Rust types (build.rs → OUT_DIR/geojson_types.rs)
+# Lives outside the repo tree, but if a copy is ever checked in, mark it generated
+geojson_types.rs linguist-generated=true

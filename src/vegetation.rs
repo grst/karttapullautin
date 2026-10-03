@@ -13,6 +13,7 @@ use crate::io::bytes::FromToBytes;
 use crate::io::fs::FileSystem;
 use crate::io::heightmap::HeightMap;
 use crate::io::xyz::XyzInternalReader;
+use crate::mapframe::{DPI, GROUND_METRES_PER_INCH, PX_PER_METRE, WorldFile};
 use crate::palette::{Palette, PaletteColorEnum, PalettedImage};
 use crate::vec2d::Vec2D;
 
@@ -253,6 +254,7 @@ pub fn makevege(
         img_height,
         PaletteColorEnum::BackgroundWhite.to_color(),
     );
+    let mut yellow_class = Vec2D::new(w_3, h_3, 0u8);
     for x in 0..(w_3 - 2) {
         for y in 0..(h_3 - 2) {
             let mut ghit2 = 0;
@@ -266,6 +268,7 @@ pub fn makevege(
                 }
             }
             if ghit2 as f64 / (highhit2 as f64 + ghit2 as f64 + 0.01) > yellowthreshold {
+                yellow_class[(x, y)] = 1;
                 imgye2.draw_filled_rect(
                     Rect::at(x as i32 * 3 + 2, (h_3 as i32 - y as i32) * 3 - 3).of_size(3, 3),
                     PaletteColorEnum::Yellow2.to_color(),
@@ -273,6 +276,7 @@ pub fn makevege(
             }
         }
     }
+    let yellow_class = yellow_class;
 
     // compute global average firsthit
     let aveg = {
@@ -295,6 +299,7 @@ pub fn makevege(
         img_height,
         PaletteColorEnum::BackgroundWhite.to_color(),
     );
+    let mut green_class = Vec2D::new(w_block, h_block, 0u8);
     for x in 0..w_block {
         for y in 0..h_block {
             let roof = top[(x, y)]
@@ -340,6 +345,7 @@ pub fn makevege(
                     }
                 }
                 if greenshade > 0 {
+                    green_class[(x, y)] = greenshade as u8;
                     imggr1.draw_filled_rect(
                         Rect::at(
                             ((x as f64 - 0.5) * block) as i32 - addition,
@@ -532,7 +538,7 @@ pub fn makevege(
     let scalefactor = config.scalefactor;
 
     // factor to convert from coordinates to pixels
-    let tmpfactor = (600.0 / 254.0 / scalefactor) as f32;
+    let tmpfactor = (PX_PER_METRE / scalefactor) as f32;
 
     let bf32 = block as f32;
     let hf32 = h_block as f32;
@@ -541,13 +547,13 @@ pub fn makevege(
     let mut x = 0.0_f32;
 
     let mut imgug = PalettedImage::new(
-        (w_block as f64 * block * 600.0 / 254.0 / scalefactor) as u32,
-        (h_block as f64 * block * 600.0 / 254.0 / scalefactor) as u32,
+        (w_block as f64 * block * DPI / GROUND_METRES_PER_INCH / scalefactor) as u32,
+        (h_block as f64 * block * DPI / GROUND_METRES_PER_INCH / scalefactor) as u32,
         PaletteColorEnum::Transparent.to_color(),
     );
     let mut img_ug_bit = GrayImage::from_pixel(
-        (w_block as f64 * block * 600.0 / 254.0 / scalefactor) as u32,
-        (h_block as f64 * block * 600.0 / 254.0 / scalefactor) as u32,
+        (w_block as f64 * block * DPI / GROUND_METRES_PER_INCH / scalefactor) as u32,
+        (h_block as f64 * block * DPI / GROUND_METRES_PER_INCH / scalefactor) as u32,
         Luma([0x00]),
     );
     loop {
@@ -686,6 +692,8 @@ pub fn makevege(
     let mut writer = fs
         .create(tmpfolder.join("undergrowth.pgw"))
         .expect("cannot create pgw file");
+    // Stays hand-written: the pixel sizes are f32 reciprocals and the rotation lines are the
+    // literal text "0.0", which WorldFile::write would print differently (ticket 18).
     write!(
         &mut writer,
         "{}\r\n0.0\r\n0.0\r\n{}\r\n{}\r\n{}\r\n",
@@ -699,11 +707,37 @@ pub fn makevege(
     let mut writer = fs
         .create(tmpfolder.join("vegetation.pgw"))
         .expect("cannot create pgw file");
-    write!(
-        &mut writer,
-        "1.0\r\n0.0\r\n0.0\r\n-1.0\r\n{xmin}\r\n{ymax}\r\n"
-    )
-    .expect("Cannot write pgw file");
+    WorldFile::write_unit_resolution(&mut writer, xmin, ymax).expect("Cannot write pgw file");
+
+    if config.vectorvege {
+        let mut ug_class = Vec2D::new(w_block_step, h_block_step, 0u8);
+        for x in 0..w_block_step {
+            for y in 0..h_block_step {
+                let ug_entry = &ug[(x, y)];
+                let value = ug_entry.ug as f64 / (ug_entry.ug as f64 + ug_entry.ugg as f64 + 0.01);
+                // the two densities the rendered map draws: two stripes per cell above
+                // `undergrowth`, a third one in between above `undergrowth2`
+                if value > uglimit2 {
+                    ug_class[(x, y)] = 2;
+                } else if value > uglimit {
+                    ug_class[(x, y)] = 1;
+                }
+            }
+        }
+        crate::vege_vector::export_all(
+            fs,
+            config,
+            tmpfolder,
+            &green_class,
+            &yellow_class,
+            &ug_class,
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+            block,
+        )?;
+    }
 
     info!("Done");
     Ok(())

@@ -1,0 +1,74 @@
+name: "E2E Tests"
+
+on:
+  push:
+    branches: ["master", "pr/*"]
+  pull_request:
+    branches: ["master"]
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-data:
+    name: Real LAZ data (French LiDAR HD)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Download LAZ tile
+        run: |
+          curl -L "https://data.geopf.fr/telechargement/download/LiDARHD-NUALID/NUALHD_1-0__LAZ_LAMB93_EP_2025-09-24/LHD_FXX_0338_6285_PTS_LAMB93_IGN69.copc.laz" -o test_file.laz
+
+      - name: Run pipeline
+        run: |
+          cp tests/e2e_config.ini pullauta.ini
+          target/release/pullauta test_file.laz
+
+      - name: Validate GeoJSON output
+        run: |
+          python3 -c "
+          import json, sys, os
+          for name in ['contours', 'dotknolls', 'formlines', 'cliffs']:
+              path = f'temp/{name}.geojson'
+              if not os.path.exists(path):
+                  print(f'SKIP: {path} not found')
+                  continue
+              d = json.load(open(path))
+              assert d['type'] == 'FeatureCollection', f'{path}: type is not FeatureCollection'
+              assert len(d['features']) > 0, f'{path}: features array is empty'
+              for i, f in enumerate(d['features'][:10]):
+                  assert f['type'] == 'Feature', f'{path}: feature[{i}] type is not Feature'
+                  assert 'type' in f['geometry'], f'{path}: feature[{i}] has no geometry type'
+              print(f'OK: {path}: {len(d[\"features\"])} features')
+          "
+
+      - name: Upload GeoJSON assets
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: geojson-output
+          path: |
+            temp/contours.geojson
+            temp/dotknolls.geojson
+            temp/formlines.geojson
+            temp/cliffs.geojson
+          if-no-files-found: warn
+          overwrite: true
+
+      - name: Upload rendered maps
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rendered-maps
+          path: |
+            pullautus.png
+            pullautus_depr.png
+          if-no-files-found: warn
+          overwrite: true

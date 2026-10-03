@@ -8,8 +8,6 @@ use rand::prelude::*;
 use rustc_hash::FxHashMap as HashMap;
 use std::collections::hash_map::Entry;
 use std::error::Error;
-use std::io::BufRead;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -24,6 +22,7 @@ use crate::io::heightmap::HeightMap;
 use crate::io::xyz::XyzInternalWriter;
 use crate::io::xyz::XyzRecord;
 use crate::knolls;
+use crate::mapframe::{DPI, GROUND_METRES_PER_INCH, WorldFile};
 use crate::merge;
 use crate::plan::InputFileIndex;
 use crate::plan::Operation;
@@ -113,6 +112,9 @@ pub fn launch_threads<F: FileSystem + Send + Clone + 'static>(
             .expect("Could not spawn thread");
         handles.push(handle);
     }
+    // The workers hold their own handles. Keeping this one would count as a live consumer forever
+    // and let `tx.push` wait for a worker that has already died.
+    drop(rx);
 
     let mut planner = plan.extract_once_planner();
 
@@ -135,7 +137,7 @@ pub fn launch_threads<F: FileSystem + Send + Clone + 'static>(
     let mut rng = rand::rng();
     let randdist = rand::distr::Bernoulli::new(thinfactor).unwrap();
 
-    while let Some(ops) = planner.next_operation() {
+    'plan: while let Some(ops) = planner.next_operation() {
         for op in ops {
             match op {
                 Operation::Extract { from, to } => {
@@ -231,7 +233,12 @@ pub fn launch_threads<F: FileSystem + Send + Clone + 'static>(
 
                     // finally post output file for processing!
                     // This will block the main thread if the queue is full to provide backpressure.
-                    tx.push(tile);
+                    if tx.push(tile).is_err() {
+                        // Every worker has exited, i.e. panicked: nothing will take the tile. Stop
+                        // planning and join them below, which propagates their panic.
+                        log::error!("All worker threads have exited; not queueing further tiles");
+                        break 'plan;
+                    }
                 }
             }
         }
@@ -546,6 +553,26 @@ pub fn process_tile(
         info!("Contour generation part 4");
         timing.start_section("contour generation part 4");
         knolls::dotknolls(fs, config, tmpfolder).unwrap();
+
+        if config.vectorvege {
+            crate::geojson::bindxf_to_geojson(
+                fs,
+                &[tmpfolder.join("out2.dxf.bin")],
+                &tmpfolder.join("contours.geojson"),
+                config.epsg,
+            )
+            .unwrap();
+            // Same reason as contours: the .dxf.bin family only leaves this folder when
+            // savetempfiles is on, so without this the served map carries no 109/111
+            // knoll or depression points at all.
+            crate::geojson::bindxf_to_geojson(
+                fs,
+                &[tmpfolder.join("dotknolls.dxf.bin")],
+                &tmpfolder.join("dotknolls.geojson"),
+                config.epsg,
+            )
+            .unwrap();
+        }
     }
 
     if !cliffsonly && !contoursonly {
@@ -558,6 +585,17 @@ pub fn process_tile(
         info!("Cliff generation");
         timing.start_section("cliff generation");
         cliffs::makecliffs(fs, config, tmpfolder).unwrap();
+    }
+    if !vegeonly && !contoursonly && config.vectorvege {
+        // Cliffs only reach output.geojson via merged.dxf.bin when savetempfiles
+        // is on; emit cliffs.geojson here so 201/202 appear in vector output regardless.
+        crate::geojson::bindxf_to_geojson(
+            fs,
+            &[tmpfolder.join("c2g.dxf.bin"), tmpfolder.join("c3g.dxf.bin")],
+            &tmpfolder.join("cliffs.geojson"),
+            config.epsg,
+        )
+        .unwrap();
     }
     if !vegeonly && !contoursonly && !cliffsonly && config.detectbuildings {
         info!("Detecting buildings");
@@ -598,8 +636,28 @@ pub fn process_tile(
     } else {
         info!("Skipped rendering");
     }
+    // When rendering is skipped here, the shapefile pass (process_zip) renders instead, and
+    // its render writes the form lines: publishing has to wait for it (batch_process).
+    if config.vectorvege && !skip_rendering {
+        info!("Publishing vector outputs");
+        timing.start_section("publishing vector outputs");
+        publish_vectors(fs, config, tmpfolder);
+    }
     info!("All done!");
     Ok(())
+}
+
+/// Bring the tile's vector outputs into their published form ([`crate::geojson::publish_tile`]).
+/// Runs once per tile, after the last render: a render rewrites `formlines.geojson`.
+fn publish_vectors(fs: &impl FileSystem, config: &Config, tmpfolder: &Path) {
+    crate::geojson::publish_tile(
+        fs,
+        tmpfolder,
+        config.formline,
+        config.epsg,
+        config.contour_chaikin,
+    )
+    .unwrap();
 }
 
 pub fn batch_process(
@@ -670,64 +728,37 @@ pub fn batch_process(
         if has_zip && !vegeonly && !cliffsonly && !contoursonly {
             process_zip(fs, conf, thread, &tmpfolder, &[], true).unwrap();
         }
+        // process_tile left publishing to here: the shapefile pass renders the map, and with it
+        // the form lines, after process_tile has finished.
+        if has_zip && conf.vectorvege {
+            info!("Publishing vector outputs");
+            publish_vectors(fs, conf, &tmpfolder);
+        }
+        if has_zip
+            && !vegeonly
+            && !cliffsonly
+            && !contoursonly
+            && conf.vectorvege
+            && !conf.contour_mask.is_empty()
+        {
+            crate::geojson::mask_contours(fs, &tmpfolder, &conf.contour_mask, conf.epsg).unwrap();
+        }
 
         // crop
         let tfw_in = PathBuf::from(format!("pullautus{thread}.pgw"));
         if fs.exists(&tfw_in) {
-            let mut lines = fs.open(&tfw_in).expect("PGW file does not exist").lines();
-            let tfw0 = lines
-                .next()
-                .expect("no 1 line")
-                .expect("Could not read line 1")
-                .parse::<f64>()
-                .unwrap();
-            let tfw1 = lines
-                .next()
-                .expect("no 2 line")
-                .expect("Could not read line 2")
-                .parse::<f64>()
-                .unwrap();
-            let tfw2 = lines
-                .next()
-                .expect("no 3 line")
-                .expect("Could not read line 3")
-                .parse::<f64>()
-                .unwrap();
-            let tfw3 = lines
-                .next()
-                .expect("no 4 line")
-                .expect("Could not read line 4")
-                .parse::<f64>()
-                .unwrap();
-            let tfw4 = lines
-                .next()
-                .expect("no 5 line")
-                .expect("Could not read line 5")
-                .parse::<f64>()
-                .unwrap();
-            let tfw5 = lines
-                .next()
-                .expect("no 6 line")
-                .expect("Could not read line 6")
-                .parse::<f64>()
-                .unwrap();
+            let tfw = WorldFile::read(fs, &tfw_in).expect("PGW file does not exist");
 
-            drop(lines);
-
-            let dx = minx - tfw4;
-            let dy = -maxy + tfw5;
+            let dx = minx - tfw.x_origin;
+            let dy = -maxy + tfw.y_origin;
 
             let mut pgw_file_out = fs.create(&tfw_in).expect("Unable to create file");
-            write!(
-                &mut pgw_file_out,
-                "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
-                tfw0,
-                tfw1,
-                tfw2,
-                tfw3,
-                minx + tfw0 / 2.0,
-                maxy - tfw0 / 2.0
-            )
+            WorldFile {
+                x_origin: minx + tfw.pixel_size_x / 2.0,
+                y_origin: maxy - tfw.pixel_size_x / 2.0,
+                ..tfw
+            }
+            .write(&mut pgw_file_out)
             .expect("Unable to write to file");
 
             drop(pgw_file_out);
@@ -741,15 +772,15 @@ pub fn batch_process(
                 .read_image_png(format!("pullautus{thread}.png"))
                 .expect("Opening image failed");
             let mut img = RgbImage::from_pixel(
-                ((maxx - minx) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
-                ((maxy - miny) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
+                ((maxx - minx) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
+                ((maxy - miny) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
                 Rgb([255, 255, 255]),
             );
             image::imageops::overlay(
                 &mut img,
                 &orig_img.to_rgb8(),
-                (-dx * 600.0 / 254.0 / scalefactor) as i64,
-                (-dy * 600.0 / 254.0 / scalefactor) as i64,
+                (-dx * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
+                (-dy * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
             );
 
             img.write_to(
@@ -764,15 +795,15 @@ pub fn batch_process(
                 .read_image_png(format!("pullautus_depr{thread}.png"))
                 .expect("Opening image failed");
             let mut img = RgbImage::from_pixel(
-                ((maxx - minx) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
-                ((maxy - miny) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
+                ((maxx - minx) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
+                ((maxy - miny) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
                 Rgb([255, 255, 255]),
             );
             image::imageops::overlay(
                 &mut img,
                 &orig_img.to_rgb8(),
-                (-dx * 600.0 / 254.0 / scalefactor) as i64,
-                (-dy * 600.0 / 254.0 / scalefactor) as i64,
+                (-dx * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
+                (-dy * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
             );
 
             img.write_to(
@@ -806,62 +837,22 @@ pub fn batch_process(
             if !contoursonly && !cliffsonly {
                 let path = format!("temp{thread}/undergrowth.pgw");
                 let tfw_in = Path::new(&path);
-                let mut lines = fs.open(tfw_in).expect("PGW file does not exist").lines();
-                let tfw0 = lines
-                    .next()
-                    .expect("no 1 line")
-                    .expect("Could not read line 1")
-                    .parse::<f64>()
-                    .unwrap();
-                let tfw1 = lines
-                    .next()
-                    .expect("no 2 line")
-                    .expect("Could not read line 2")
-                    .parse::<f64>()
-                    .unwrap();
-                let tfw2 = lines
-                    .next()
-                    .expect("no 3 line")
-                    .expect("Could not read line 3")
-                    .parse::<f64>()
-                    .unwrap();
-                let tfw3 = lines
-                    .next()
-                    .expect("no 4 line")
-                    .expect("Could not read line 4")
-                    .parse::<f64>()
-                    .unwrap();
-                let tfw4 = lines
-                    .next()
-                    .expect("no 5 line")
-                    .expect("Could not read line 5")
-                    .parse::<f64>()
-                    .unwrap();
-                let tfw5 = lines
-                    .next()
-                    .expect("no 6 line")
-                    .expect("Could not read line 6")
-                    .parse::<f64>()
-                    .unwrap();
+                let tfw = WorldFile::read(fs, tfw_in).expect("PGW file does not exist");
 
-                let dx = minx - tfw4;
-                let dy = -maxy + tfw5;
+                let dx = minx - tfw.x_origin;
+                let dy = -maxy + tfw.y_origin;
 
                 let mut pgw_file_out = fs
                     .create(PathBuf::from(&format!(
                         "{batchoutfolder}/{laz}_undergrowth.pgw"
                     )))
                     .expect("Unable to create file");
-                write!(
-                    &mut pgw_file_out,
-                    "{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n{}\r\n",
-                    tfw0,
-                    tfw1,
-                    tfw2,
-                    tfw3,
-                    minx + tfw0 / 2.0,
-                    maxy - tfw0 / 2.0
-                )
+                WorldFile {
+                    x_origin: minx + tfw.pixel_size_x / 2.0,
+                    y_origin: maxy - tfw.pixel_size_x / 2.0,
+                    ..tfw
+                }
+                .write(&mut pgw_file_out)
                 .expect("Unable to write to file");
                 drop(pgw_file_out);
 
@@ -873,15 +864,15 @@ pub fn batch_process(
                 orig_img_reader.no_limits();
                 let orig_img = orig_img_reader.decode().unwrap();
                 let mut img = RgbaImage::from_pixel(
-                    ((maxx - minx) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
-                    ((maxy - miny) * 600.0 / 254.0 / scalefactor + 2.0) as u32,
+                    ((maxx - minx) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
+                    ((maxy - miny) * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as u32,
                     Rgba([255, 255, 255, 0]),
                 );
                 image::imageops::overlay(
                     &mut img,
                     &orig_img,
-                    (-dx * 600.0 / 254.0 / scalefactor) as i64,
-                    (-dy * 600.0 / 254.0 / scalefactor) as i64,
+                    (-dx * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
+                    (-dy * DPI / GROUND_METRES_PER_INCH / scalefactor) as i64,
                 );
 
                 img.write_to(
@@ -917,13 +908,8 @@ pub fn batch_process(
                 let mut pgw_file_out = fs
                     .create(format!("{batchoutfolder}/{laz}_vege.pgw"))
                     .expect("Unable to create file");
-                write!(
-                    &mut pgw_file_out,
-                    "1.0\r\n0.0\r\n0.0\r\n-1.0\r\n{}\r\n{}\r\n",
-                    minx + 0.5,
-                    maxy - 0.5
-                )
-                .expect("Unable to write to file");
+                WorldFile::write_unit_resolution(&mut pgw_file_out, minx + 0.5, maxy - 0.5)
+                    .expect("Unable to write to file");
 
                 drop(pgw_file_out);
 
@@ -1054,6 +1040,31 @@ pub fn batch_process(
                 maxy,
             )
             .unwrap();
+        }
+
+        // crop vector GeoJSON outputs (present when vectorvege=1 / an OSM vectorconf is set)
+        let to_wgs84 = if conf.geojson_wgs84 {
+            // config validation guarantees epsg is set
+            Some(crate::geojson::Wgs84::new(conf.epsg.unwrap()).unwrap())
+        } else {
+            None
+        };
+        for out in crate::geojson::GEOJSON_OUTPUTS {
+            let name = out.name;
+            let geojson_file = PathBuf::from(format!("temp{thread}/{name}.geojson"));
+            if fs.exists(&geojson_file) {
+                crate::geojson::crop_geojson(
+                    fs,
+                    &geojson_file,
+                    Path::new(&format!("{batchoutfolder}/{laz}_{name}.geojson")),
+                    minx,
+                    miny,
+                    maxx,
+                    maxy,
+                    to_wgs84.as_ref(),
+                )
+                .unwrap();
+            }
         }
         if savetempfolders {
             fs.create_dir_all(format!("temp_{laz}_dir"))

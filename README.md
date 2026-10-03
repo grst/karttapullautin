@@ -123,6 +123,24 @@ In additon to the png raster map imges, Karttapullautin makes also vector contou
 - `c2g.dxf`: big cliffs
 - `vegetation.png + vegetation.pgw`: generalized green/yellow as raster, same as at the background of final map png files.
 
+#### GeoJSON
+
+With `vectorvege=1` Karttapullautin also writes the map as GeoJSON, one `FeatureCollection` per layer: `contours`, `formlines`, `dotknolls`, `cliffs`, `vegetation`, `yellow`, `undergrowth`, and, when a `vectorconf` is set, `osm_lines` and `osm_areas`. In batch mode they are cropped per tile to `<tile>_<layer>.geojson` in the output folder. They are the published map rather than the raw detector output: contours are generalised and broken around the knoll symbols, the cliff dashes are chained into cliff lines, and the vegetation is traced into polygons.
+
+Every feature carries `layer` (Karttapullautin's own class, the DXF layer name) and `isom` (the ISOM 2017-2 symbol code, or for the shapefile features the code from the `vectorconf` file); contours also carry `elevation`. The property schema is `schema/geojson.schema.json`.
+
+LiDAR has no ground on open water, so contours traced across a lake are interpolation. `contour_mask` names `vectorconf` categories (the first field of a rule) whose areas hide the contours, form lines and knolls in the GeoJSON: with `contour_mask=lake` and a rule `lake|301|natural=water&water!=river`, the lines are cut at the shore while a river, matched by a rule of another name, keeps the contours that cross it. Batch mode, after the shapefile pass.
+
+Every published depression -- contour or form line, oriented with downhill on the right -- gets slope lines (`layer` `slope_line`, `isom` `101.1`): 6 m lines at right angles to it, pointing into the depression, one per started 150 m of line, placed by the geometry alone so that two tiles agree.
+
+`contour_chaikin` rounds the corners of the published contours and form lines (Chaikin corner cutting, that many rounds; 0 = off). Each new point depends only on two neighbouring vertices, so a contour stays identical across a tile edge.
+
+Pylons: a `vectorconf` rule whose code is a line code with a `P` suffix matches point shapes, the pylons of that line symbol, e.g. `pylon|516P|power=tower`. Wherever such a point is a vertex of a line of that code, a bar across the line is drawn (ISOM 510/511: 0.74 / 1.94 mm at 1:15 000), in the PNG and in `osm_lines` as further parts of the line's code.
+
+Coordinates are in the input CRS; set `epsg` to declare it in the files. With `geojson_wgs84=1` (batch mode, `epsg` required) the per-tile files are instead reprojected to WGS84 longitude/latitude, which is what tools such as [tippecanoe](https://github.com/felt/tippecanoe) read, so they can go straight into a vector tile pyramid:
+
+    tippecanoe -e tiles -L contours:out/593_5269_contours.geojson -L vegetation:out/593_5269_vegetation.geojson ...
+
 For importing Maastotietokanta, try reading shape filed directly to your mapping app. Note that the `dxf` files need to be converted from the internal `.bin.dxf` format using the command `bin2dxf` as mentioned above.
 
 ### Batch processing

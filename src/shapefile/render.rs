@@ -10,13 +10,14 @@ use log::{debug, info};
 use crate::{
     config::Config,
     io::fs::FileSystem,
+    mapframe::{DPI, GROUND_METRES_PER_INCH, PX_PER_METRE, WorldFile},
     shapefile::{
         canvas::{Canvas, Color},
         mapping::{Mapping, Operator},
     },
 };
 use shapefile::dbase::{FieldValue, Record};
-use shapefile::{Polygon, Polyline, Shape, ShapeType};
+use shapefile::{Polygon, PolygonRing, Polyline, Shape, ShapeType};
 
 #[derive(PartialEq, Eq)]
 enum EdgeImage {
@@ -76,12 +77,9 @@ pub fn render(
         return Ok(());
     }
 
-    let data = fs.read_to_string(input).expect("Can not read input file");
-    let d: Vec<&str> = data.split('\n').collect();
-
-    let x0 = d[4].trim().parse::<f64>().unwrap();
-    let y0 = d[5].trim().parse::<f64>().unwrap();
-    // let resvege = d[0].trim().parse::<f64>().unwrap();
+    let w = WorldFile::read(fs, input).expect("Can not read input file");
+    let x0 = w.x_origin;
+    let y0 = w.y_origin;
 
     let mut img_reader = image::ImageReader::new(
         fs.open(tmpfolder.join("vegetation.png"))
@@ -93,8 +91,8 @@ pub fn render(
     let w = img.width() as f64;
     let h = img.height() as f64;
 
-    let outw = w * 600.0 / 254.0 / scalefactor;
-    let outh = h * 600.0 / 254.0 / scalefactor;
+    let outw = w * DPI / GROUND_METRES_PER_INCH / scalefactor;
+    let outh = h * DPI / GROUND_METRES_PER_INCH / scalefactor;
 
     // TODO: only allocate the canvas that are actually used... in a lazy way
     let (width, height) = (outw as u32, outh as u32);
@@ -131,6 +129,12 @@ pub fn render(
         tmpfolder.to_path_buf()
     };
 
+    // world-coordinate vector export: (isom, category, parts/rings)
+    type GeoFeature = (String, String, Vec<Vec<[f64; 2]>>);
+    let mut geo_lines: Vec<GeoFeature> = Vec::new();
+    let mut geo_areas: Vec<GeoFeature> = Vec::new();
+    let mut pylons = Pylons::new();
+
     let mut shp_files: Vec<PathBuf> = Vec::new();
 
     for path in fs.list(&shapetmpfolder).unwrap() {
@@ -151,10 +155,10 @@ pub fn render(
         // drawshape comes here
         let mut reader = fs.read_shapefile(file.clone())?;
         let bbox = reader.header().bbox;
-        let minx = (600.0 / 254.0 / scalefactor * (bbox.min.x - x0)).floor();
-        let maxy = (600.0 / 254.0 / scalefactor * (y0 - bbox.min.y)).floor();
-        let maxx = (600.0 / 254.0 / scalefactor * (bbox.max.x - x0)).floor();
-        let miny = (600.0 / 254.0 / scalefactor * (y0 - bbox.max.y)).floor();
+        let minx = (PX_PER_METRE / scalefactor * (bbox.min.x - x0)).floor();
+        let maxy = (PX_PER_METRE / scalefactor * (y0 - bbox.min.y)).floor();
+        let maxx = (PX_PER_METRE / scalefactor * (bbox.max.x - x0)).floor();
+        let miny = (PX_PER_METRE / scalefactor * (y0 - bbox.max.y)).floor();
         log::debug!("Bounding box: {bbox:?}");
         if minx > outw || maxx < 0.0 || miny > outh || maxy < 0.0 {
             info!("Skipping shapefile {}, out of bounds.", file.display());
@@ -167,16 +171,33 @@ pub fn render(
             let (shape, record) = shape_record
                 .unwrap_or_else(|_err: shapefile::Error| (Shape::NullShape, Record::default()));
 
+            // A point is drawn only as a pylon of a line symbol (a `<code>P` rule); the
+            // bars are added once every line has been read.
+            if let Shape::Point(ref pt) = shape {
+                if let Some(code) = vectorconf_mappings
+                    .iter()
+                    .filter_map(|m| m.isom.strip_suffix('P').map(|code| (m, code)))
+                    .find(|(m, _)| mapping_matches(m, &record))
+                    .map(|(_, code)| code)
+                {
+                    pylons
+                        .entry(code.to_string())
+                        .or_default()
+                        .insert(pylon_key(pt.x, pt.y));
+                }
+                continue;
+            }
+
             let bbox = match shape {
                 Shape::Polygon(ref p) => p.bbox(),
                 Shape::Polyline(ref p) => p.bbox(),
                 _ => continue, // we don't care about other types
             };
 
-            let minx = (600.0 / 254.0 / scalefactor * (bbox.min.x - x0)).floor();
-            let maxy = (600.0 / 254.0 / scalefactor * (y0 - bbox.min.y)).floor();
-            let maxx = (600.0 / 254.0 / scalefactor * (bbox.max.x - x0)).floor();
-            let miny = (600.0 / 254.0 / scalefactor * (y0 - bbox.max.y)).floor();
+            let minx = (PX_PER_METRE / scalefactor * (bbox.min.x - x0)).floor();
+            let maxy = (PX_PER_METRE / scalefactor * (y0 - bbox.min.y)).floor();
+            let maxx = (PX_PER_METRE / scalefactor * (bbox.max.x - x0)).floor();
+            let miny = (PX_PER_METRE / scalefactor * (y0 - bbox.max.y)).floor();
             if minx > outw || maxx < 0.0 || miny > outh || maxy < 0.0 {
                 continue;
             }
@@ -186,6 +207,7 @@ pub fn render(
             let mut edgeimage = EdgeImage::Black;
             let mut thickness = 1.0;
             let mut color: Option<(Color, Image)> = None;
+            let mut matched: Option<&Mapping> = None;
             let mut dashedline = false;
             let mut border = 0.0;
 
@@ -381,26 +403,8 @@ pub fn render(
                         break;
                     }
 
-                    // check if the record matches the conditions
-                    let mut is_ok = true;
-                    for keyval in &mapping.conditions {
-                        let mut r = String::from("");
-                        if let Some(FieldValue::Character(Some(record_str))) =
-                            record.get(&keyval.key)
-                        {
-                            r = record_str.trim().to_string();
-                        }
-                        if keyval.operator == Operator::Equal {
-                            if r != keyval.value {
-                                is_ok = false;
-                            }
-                        } else if r == keyval.value {
-                            is_ok = false;
-                        }
-                    }
-
                     // no match? continue to the next mapping
-                    if !is_ok {
+                    if !mapping_matches(mapping, &record) {
                         continue;
                     }
 
@@ -452,6 +456,27 @@ pub fn render(
 
                     // road, bridges
                     if isom == "503T" {
+                        edgeimage = EdgeImage::BlackTop;
+                        imgbrown.set_line_width(14.0);
+                        imgbrowntop.set_line_width(14.0);
+                        color = Some((brown, Image::Brown));
+                        roadedge = 26.0;
+                        thickness = 14.0;
+                        imgblack.set_line_width(26.0);
+                    }
+
+                    // wide road, drawn like 503 in raster; distinct code kept for vector export
+                    if isom == "502" {
+                        imgbrown.set_line_width(20.0);
+                        imgbrowntop.set_line_width(20.0);
+                        color = Some((brown, Image::Brown));
+                        roadedge = 26.0;
+                        thickness = 20.0;
+                        imgblack.set_line_width(26.0);
+                    }
+
+                    // wide road, bridges
+                    if isom == "502T" {
                         edgeimage = EdgeImage::BlackTop;
                         imgbrown.set_line_width(14.0);
                         imgbrowntop.set_line_width(14.0);
@@ -556,6 +581,11 @@ pub fn render(
                         area = true;
                         color = Some((brown, Image::Brown));
                     }
+
+                    // remember the mapping that produced the match, for vector export
+                    if color.is_some() && matched.is_none() {
+                        matched = Some(mapping);
+                    }
                 }
             }
 
@@ -564,14 +594,25 @@ pub fn render(
                 let shapetype = shape.shapetype();
                 if !area && shapetype == ShapeType::Polyline {
                     let polyline = Polyline::try_from(shape).unwrap();
+                    if let Some(m) = matched {
+                        geo_lines.push((
+                            m.isom.clone(),
+                            m.description.clone(),
+                            polyline
+                                .parts()
+                                .iter()
+                                .map(|part| part.iter().map(|pt| [pt.x, pt.y]).collect())
+                                .collect(),
+                        ));
+                    }
                     let mut poly: Vec<(f32, f32)> = vec![];
                     for points in polyline.parts().iter() {
                         for point in points.iter() {
                             let x = point.x;
                             let y = point.y;
                             poly.push((
-                                (600.0 / 254.0 / scalefactor * (x - x0)).floor() as f32,
-                                (600.0 / 254.0 / scalefactor * (y0 - y)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (x - x0)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (y0 - y)).floor() as f32,
                             ));
                         }
                     }
@@ -648,6 +689,44 @@ pub fn render(
                     }
                 } else if area && shapetype == ShapeType::Polygon {
                     let polygon = Polygon::try_from(shape).unwrap();
+                    if let Some(m) = matched {
+                        // A shapefile polygon may hold several outer rings, each followed by
+                        // its holes; GeoJSON reads every ring after the first as a hole, so
+                        // each outer ring becomes a polygon of its own.
+                        // The renderer strokes some areas with a black border (a lake's bank,
+                        // a field's edge). As a line of its own, so that it follows the shape
+                        // and not the tile edge a cropped polygon also has: `<code>.1`, the
+                        // convention the rules file already uses for 301.1 and 529.1.
+                        if border > 0.0 {
+                            geo_lines.push((
+                                format!("{}.1", m.isom),
+                                m.description.clone(),
+                                polygon
+                                    .rings()
+                                    .iter()
+                                    .map(|ring| {
+                                        ring.points().iter().map(|pt| [pt.x, pt.y]).collect()
+                                    })
+                                    .collect(),
+                            ));
+                        }
+                        let first = geo_areas.len();
+                        for ring in polygon.rings() {
+                            let pts = ring.points().iter().map(|pt| [pt.x, pt.y]).collect();
+                            match ring {
+                                PolygonRing::Outer(_) => geo_areas.push((
+                                    m.isom.clone(),
+                                    m.description.clone(),
+                                    vec![pts],
+                                )),
+                                // a hole before any outer ring of this shape has none to go in
+                                PolygonRing::Inner(_) if geo_areas.len() > first => {
+                                    geo_areas.last_mut().unwrap().2.push(pts);
+                                }
+                                PolygonRing::Inner(_) => {}
+                            }
+                        }
+                    }
                     let mut polys: Vec<Vec<(f32, f32)>> = vec![];
                     for ring in polygon.rings().iter() {
                         let mut poly: Vec<(f32, f32)> = vec![];
@@ -656,12 +735,12 @@ pub fn render(
                             let x = point.x;
                             let y = point.y;
                             poly.push((
-                                (600.0 / 254.0 / scalefactor * (x - x0)).floor() as f32,
-                                (600.0 / 254.0 / scalefactor * (y0 - y)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (x - x0)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (y0 - y)).floor() as f32,
                             ));
                             polyborder.push((
-                                (600.0 / 254.0 / scalefactor * (x - x0)).floor() as f32,
-                                (600.0 / 254.0 / scalefactor * (y0 - y)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (x - x0)).floor() as f32,
+                                (PX_PER_METRE / scalefactor * (y0 - y)).floor() as f32,
                             ));
                         }
                         polys.push(poly);
@@ -708,6 +787,37 @@ pub fn render(
         }
     }
     info!("Total time elapsed in drawing shapes: {total_elapsed:.2?}",);
+
+    // Pylon bars, drawn with their line's symbol: in the map like the line itself, and in the
+    // vector export as more parts of the same code.
+    let mut bars: Vec<GeoFeature> = Vec::new();
+    for (isom, category, parts) in &geo_lines {
+        let code = isom.trim_end_matches('T');
+        let Some(at) = pylons.get(code) else {
+            continue;
+        };
+        let length = pylon_bar_mm(code) * 10.0 * scalefactor;
+        let found = pylon_bars(parts, at, length);
+        if found.is_empty() {
+            continue;
+        }
+        imgblacktop.set_color(black);
+        imgblacktop.set_line_width(5.0);
+        for bar in &found {
+            let poly: Vec<(f32, f32)> = bar
+                .iter()
+                .map(|p| {
+                    (
+                        (PX_PER_METRE / scalefactor * (p[0] - x0)).floor() as f32,
+                        (PX_PER_METRE / scalefactor * (y0 - p[1])).floor() as f32,
+                    )
+                })
+                .collect();
+            imgblacktop.draw_polyline(&poly);
+        }
+        bars.push((isom.clone(), category.clone(), found));
+    }
+    geo_lines.extend(bars);
     imgblue2.overlay(&mut imgblue, 0.0, 0.0);
     imgblue2.overlay(&mut imgblue, 1.0, 0.0);
     imgblue2.overlay(&mut imgblue, 0.0, 1.0);
@@ -715,9 +825,9 @@ pub fn render(
 
     let mut i = 0.0_f32;
     imgmarsh.set_transparent_color();
-    while i < ((h * 600.0 / 254.0 / scalefactor + 500.0) as f32) {
+    while i < ((h * DPI / GROUND_METRES_PER_INCH / scalefactor + 500.0) as f32) {
         i += 14.0;
-        let wd = (w * 600.0 / 254.0 / scalefactor + 2.0) as f32;
+        let wd = (w * DPI / GROUND_METRES_PER_INCH / scalefactor + 2.0) as f32;
         imgmarsh.draw_filled_polygon(&[vec![
             (-1.0, i),
             (wd, i),
@@ -755,5 +865,142 @@ pub fn render(
     imgolive
         .save_as(fs, &low_file)
         .expect("could not save low.png");
+
+    // Property schema: see `schema/geojson.schema.json` ($defs/OsmProperties).
+    // vector export of the matched OSM features, in world coordinates
+    if !vectorconf_mappings.is_empty() {
+        let to_features = |feats: &[GeoFeature], gtype: &str| {
+            feats
+                .iter()
+                .map(|(isom, category, parts)| {
+                    crate::geojson::feature(
+                        gtype,
+                        serde_json::Value::Array(
+                            parts
+                                .iter()
+                                .map(|p| crate::geojson::coords_line(p.iter().copied()))
+                                .collect(),
+                        ),
+                        &[
+                            ("layer", isom.as_str()),
+                            ("isom", isom.as_str()),
+                            ("category", category.as_str()),
+                        ],
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let crs = crate::geojson::crs(config.epsg);
+        crate::geojson::write_feature_collection(
+            &mut std::io::BufWriter::new(fs.create(tmpfolder.join("osm_lines.geojson"))?),
+            &to_features(&geo_lines, "MultiLineString"),
+            crs.as_ref(),
+        )?;
+        crate::geojson::write_feature_collection(
+            &mut std::io::BufWriter::new(fs.create(tmpfolder.join("osm_areas.geojson"))?),
+            &to_features(&geo_areas, "Polygon"),
+            crs.as_ref(),
+        )?;
+    }
     Ok(())
+}
+
+/// True when `record` meets every condition of `mapping`. An absent field compares equal to
+/// the empty string, as it always has.
+fn mapping_matches(mapping: &Mapping, record: &Record) -> bool {
+    mapping.conditions.iter().all(|keyval| {
+        let r = match record.get(&keyval.key) {
+            Some(FieldValue::Character(Some(record_str))) => record_str.trim(),
+            _ => "",
+        };
+        (keyval.operator == Operator::Equal) == (r == keyval.value)
+    })
+}
+
+/// Length of the bar that marks a pylon on a line symbol, in mm of paper at 1:10 000: ISOM
+/// 2017-2 510 power line 0.74 mm and 511 major power line 1.94 mm at 1:15 000, enlarged by 1.5
+/// (ISOM 2000 codes 516 and 517, as the rules file numbers them).
+fn pylon_bar_mm(line_code: &str) -> f64 {
+    match line_code {
+        "517" => 1.94 * 1.5,
+        _ => 0.74 * 1.5,
+    }
+}
+
+/// A point of a rules file's `<code>P` rule -- `pylon|516P|power=tower` -- marks a pylon of
+/// the line symbol `<code>`. Keyed by position to the centimetre: OSM pylons are nodes of the
+/// line, so they share its vertices exactly.
+type Pylons = std::collections::HashMap<String, std::collections::HashSet<(i64, i64)>>;
+
+fn pylon_key(x: f64, y: f64) -> (i64, i64) {
+    ((x * 100.0).round() as i64, (y * 100.0).round() as i64)
+}
+
+/// The bars that mark the pylons along a line: at every vertex that is a pylon, a segment
+/// of `length` ground metres across the line, perpendicular to the mean direction of the two
+/// segments meeting there.
+fn pylon_bars(
+    parts: &[Vec<[f64; 2]>],
+    pylons: &std::collections::HashSet<(i64, i64)>,
+    length: f64,
+) -> Vec<Vec<[f64; 2]>> {
+    let unit = |a: [f64; 2], b: [f64; 2]| {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let d = (dx * dx + dy * dy).sqrt();
+        if d > 0.0 {
+            [dx / d, dy / d]
+        } else {
+            [0.0, 0.0]
+        }
+    };
+    let mut bars = Vec::new();
+    for part in parts {
+        for (i, p) in part.iter().enumerate() {
+            if !pylons.contains(&pylon_key(p[0], p[1])) {
+                continue;
+            }
+            let before = (i > 0).then(|| unit(part[i - 1], *p));
+            let after = (i + 1 < part.len()).then(|| unit(*p, part[i + 1]));
+            let dir = match (before, after) {
+                (Some(a), Some(b)) => unit([0.0, 0.0], [a[0] + b[0], a[1] + b[1]]),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => continue,
+            };
+            if dir == [0.0, 0.0] {
+                continue;
+            }
+            let h = length / 2.0;
+            bars.push(vec![
+                [p[0] - dir[1] * h, p[1] + dir[0] * h],
+                [p[0] + dir[1] * h, p[1] - dir[0] * h],
+            ]);
+        }
+    }
+    bars
+}
+
+#[cfg(test)]
+mod pylon_tests {
+    use super::*;
+
+    #[test]
+    fn a_bar_crosses_the_line_at_each_pylon_and_nowhere_else() {
+        let line = vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]]];
+        let pylons = [pylon_key(0.0, 0.0), pylon_key(10.0, 0.0)]
+            .into_iter()
+            .collect();
+        let bars = pylon_bars(&line, &pylons, 2.0);
+        assert_eq!(bars.len(), 2);
+        // at the end: across the segment
+        assert_eq!(bars[0], vec![[0.0, 1.0], [0.0, -1.0]]);
+        // at the corner: across the bisector, centred on the vertex
+        let [a, b] = [bars[1][0], bars[1][1]];
+        assert!(((a[0] + b[0]) / 2.0 - 10.0).abs() < 1e-9 && ((a[1] + b[1]) / 2.0).abs() < 1e-9);
+        let len = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+        assert!((len - 2.0).abs() < 1e-9);
+        assert!(
+            ((a[0] - b[0]) - (a[1] - b[1])).abs() > 1.0,
+            "perpendicular to the bisector"
+        );
+    }
 }

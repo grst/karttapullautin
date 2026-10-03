@@ -27,6 +27,15 @@ impl<T> Vec2D<T> {
         self.h
     }
 
+    /// Index is (x, y); None when out of bounds.
+    pub fn get(&self, index: (usize, usize)) -> Option<&T> {
+        if index.0 >= self.w || index.1 >= self.h {
+            None
+        } else {
+            Some(&self.data[index.0 * self.h + index.1])
+        }
+    }
+
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, usize, &mut T)> + '_ {
         let h = self.h;
         self.data.iter_mut().enumerate().map(move |(i, v)| {
@@ -157,6 +166,16 @@ mod tests {
     fn test_index_out_of_bounds_1() {
         let vec2d: Vec2D<i32> = Vec2D::new(3, 2, 1);
         let _ = vec2d[(0, 2)];
+    }
+
+    #[test]
+    fn test_get() {
+        let mut vec2d: Vec2D<i32> = Vec2D::new(3, 2, 1);
+        vec2d[(2, 1)] = 7;
+        assert_eq!(vec2d.get((0, 0)), Some(&1));
+        assert_eq!(vec2d.get((2, 1)), Some(&7));
+        assert_eq!(vec2d.get((3, 0)), None);
+        assert_eq!(vec2d.get((0, 2)), None);
     }
 
     #[test]
